@@ -57,7 +57,7 @@ const CMD = {
   START_COURSE_LOADING:    81,   // オンライン対戦: ルームホストの要求で、ルームのコースデータをルーム全員へ一斉送信する
   BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
   BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
-  GET_ONLINECOURSE_INFO:   84,   // オンライン対戦: ルームのコースの基本情報（タイトル・職人名）をルーム全員へ一斉送信する
+  GET_ONLINECOURSE_INFO:   84,   // 返信専用: CMD=81のコースデータ送信が終わった後に、コースの基本情報（タイトル・職人名）をルーム全員へ自動送信する
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -74,7 +74,7 @@ const CMD = {
 
 // 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
 const KNOWN_CMDS = Object.fromEntries(
-  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED")
+  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED" && k !== "GET_ONLINECOURSE_INFO")
 );
 
 const SEND_INTERVAL = 120;
@@ -398,12 +398,15 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=81 start_course-loading: ルームのコースデータを、ルーム全員へ一斉送信する
+  // CMD=81 start_course-loading: ルームのコースデータと基本情報を、ルーム全員へ一斉送信する
   // リクエスト: 基礎データ(userId + cmd + username) + ルームID(Len)。ルームホスト（最初にルームを立ち上げたユーザー）が送る。
-  // 返信: CMD=30(GET_COURSE)と同じ形式のコースデータ。ただし userId の部分を「ルームID」にして送る。
-  //       （ルームIDあてに送るので、ホスト以外の参加者も同時に受信できる）
-  // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく（CMD=84と同じコースになる）。
-  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
+  // 返信（どちらも userId の部分を「ルームID」にして送る。ルームIDあてなので、ホスト以外の参加者も同時に受信できる）:
+  //   1) CMD=30(GET_COURSE)と同じ形式のコースデータ
+  //   2) 1)を全部送り終えた後に、CMD=84(GET_ONLINECOURSE_INFO)としてコースの基本情報を自動送信
+  //      = roomId(LenLen) + cmd(Len) + コースのタイトル(text) + コースを作った職人名(alphabet)
+  //      （CMD=84はクライアントから受け取らない。返信専用）
+  // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく。
+  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 だけを送る。
   if (cmd === CMD.START_COURSE_LOADING) {
     const { value: roomId } = decodeLen(s, pos);
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
@@ -414,39 +417,8 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendCourseData(setter, roomId, row.stage_data);
-    return;
-  }
-
-  // CMD=84 get_onlinecourse_info: ルームのコースの基本情報を、ルーム全員へ一斉送信する
-  // リクエスト: 基礎データ + ルームID(Len)。ルームホストが送る。
-  // 返信: roomId(LenLen) + cmd(Len) + コースのタイトル(text) + コースを作った職人名(alphabet)
-  //       （userId の部分を「ルームID」にして送る。コースはCMD=81と同じルームのコース）
-  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
-  if (cmd === CMD.GET_ONLINECOURSE_INFO) {
-    const { value: roomId } = decodeLen(s, pos);
-    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
-    const courseId = await db.getBattleRoomCourse(roomId);
-    const info = courseId ? await db.getCourseBasicInfo(courseId) : null;
-    if (!info) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
-      return;
-    }
     await sendCloud(setter, randomCloud(),
-      encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(info.title) + encodeAlphabet(info.author));
-    return;
-  }
-
-  // CMD=82: 週間バトルランキング / CMD=83: 全期間バトルランキング
-  // リクエスト: 基礎データ + 最大件数(Len)
-  // 返信: CMD=16と同じく、1行ごとに 順位(Len) + 職人名(alphabet) + 勝利数(Len) + レート(Len) を並べて送り、最後にCMD=1000を送る
-  if (cmd === CMD.BATTLE_RANK_WEEK || cmd === CMD.BATTLE_RANK_ALL) {
-    const { value: limit } = decodeLen(s, pos);
-    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
-    const rows = cmd === CMD.BATTLE_RANK_WEEK
-      ? await db.getBattleRankingWeek(limit)
-      : await db.getBattleRankingAll(limit);
-    await sendBattleRankingList(setter, userId, cmd, rows);
-    await sendEndMarker(setter, userId);
+      encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(row.title) + encodeAlphabet(row.author));
     return;
   }
 
