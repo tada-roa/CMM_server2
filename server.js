@@ -1,0 +1,2193 @@
+"use strict";
+/**
+ * マリオメーカー風ゲーム クラウド変数サーバー v3
+ * Scratch Cloud / TurboWarp Cloud ともに生WebSocketで直接接続する
+ */
+
+const WebSocket = require("ws");
+const https     = require("https");
+const http      = require("http");
+const fs        = require("fs");
+const path      = require("path");
+
+const db = require("./database");
+const pwcrypt = require("./pwcrypt");
+const {
+  encodeNum, decodeNum,
+  encodeLen, decodeLen,
+  encodeLenLen, decodeLenLen,
+  encodeAlphabet, decodeAlphabet,
+  encodeText, decodeText,
+  minutesToDateTimeInt,
+} = require("./encode");
+
+const USERNAME      = process.env.SCRATCH_USERNAME;
+const PASSWORD      = process.env.SCRATCH_PASSWORD;
+const PROJECT_ID    = parseInt(process.env.SCRATCH_PROJECT_ID, 10);
+const PORT          = parseInt(process.env.PORT || "3000", 10);
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+
+const REQUEST_VARS = ["☁ request1", "☁ request2"];
+const CLOUD_VARS   = [
+  "☁ cloud1","☁ cloud2","☁ cloud3","☁ cloud4",
+  "☁ cloud5","☁ cloud6","☁ cloud7","☁ cloud8",
+];
+
+const CMD = {
+  UPLOAD:          1,
+  DELETE_COURSE:   2,
+  RECOMMENDED:     3,   // 運営おすすめコースの取得（リクエスト形式はCMD=10と同じ）
+  RANDOM:         10,
+  WEEKLY:         11,
+  ALL_TIME:       12,
+  SEARCH_ID:      13,
+  SEARCH_AUTHOR:  14,
+  NEW_ARRIVAL:    15,
+  MAKER_RANK_WEEK:16,
+  MAKER_RANK_ALL: 17,
+  MAKER_INFO:     18,
+  OFFICIAL_MAKER: 19,
+  REGISTER_CHECK_AUTHOR:   50,
+  REGISTER_CHECK_USERNAME: 51,
+  REGISTER_SUBMIT:         52,
+  REGISTER_STATUS:         53,
+  REGISTER_LOGIN:          54,
+  GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
+  GET_ONLINE_MAKER_INFO:   80,   // オンライン対戦(通信であそぶ)の職人のバトル情報
+  START_COURSE_LOADING:    81,   // オンライン対戦: ルームホストの要求で、ルームのコースデータをルーム全員へ一斉送信する
+  BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
+  BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
+  GET_ONLINECOURSE_INFO:   84,   // オンライン対戦: ルームのコースの基本情報（タイトル・職人名）をルーム全員へ一斉送信する
+  LIKE:           20,
+  PLAY:           21,
+  ATTEMPT:        22,
+  CLEAR:          23,
+  GET_COURSE:     30,
+  GET_NOTIFY:     40,
+  GET_STATS:      90,
+  GET_ANNOUNCEMENT:91,
+  BAN_USERNAME:  600,
+  END_MARKER:   1000,
+  DISABLED:     1001,   // 使用不可CMDを受信したときの返信
+  NOT_ENCRYPTED: 409,   // 暗号化されていないと思われるパスワードを受信したときの返信
+};
+
+// 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
+const KNOWN_CMDS = Object.fromEntries(
+  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED")
+);
+
+const SEND_INTERVAL = 120;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
+
+// ── パスワード暗号化用ノンス（CMD=55で発行 → CMD=52/54で1回だけ使える）──
+// ユーザー名ごとに1つ。再発行すると前のノンスは無効になる。
+const NONCE_TTL_MS = 60 * 1000;   // ノンスの有効時間（60秒）
+const nonceStore = new Map();     // username -> { nonce, expires }
+
+function issueNonce(username) {
+  const nonce = pwcrypt.generateNonce();
+  nonceStore.set(username, { nonce, expires: Date.now() + NONCE_TTL_MS });
+  return nonce;
+}
+
+/**
+ * そのユーザー名に発行済みのノンスで、暗号化されたパスワードを復号する。
+ * ノンスは成功・失敗にかかわらず1回使ったら破棄する（盗み見た暗号文の再送を防ぐ）。
+ * ノンスがない・期限切れ・復号できない場合は null。
+ */
+function decryptPasswordWithNonce(username, cipher) {
+  const entry = nonceStore.get(username);
+  if (!entry) return null;
+  nonceStore.delete(username);
+  if (Date.now() > entry.expires) return null;
+  return pwcrypt.decryptPassword(cipher, entry.nonce);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [u, e] of nonceStore) if (now > e.expires) nonceStore.delete(u);
+}, 60 * 1000).unref();
+
+// ── CMD=54 成功の記録（CMD=2の認可用）──
+const LOGIN_VALID_MS = 5 * 60 * 1000;          // ログイン有効時間（5分）
+const DELETE_REQUIRE_AUTHOR_MATCH = true;      // trueなら「ログインした職人名＝コースの作者」も要求
+const loginVerified = new Map();               // username -> { author, at }
+
+function recordLoginSuccess(username, author) {
+  loginVerified.set(username, { author, at: Date.now() });
+}
+function getValidLogin(username) {
+  const e = loginVerified.get(username);
+  if (!e) return null;
+  if (Date.now() - e.at > LOGIN_VALID_MS) { loginVerified.delete(username); return null; }
+  return e;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [u, e] of loginVerified) if (now - e.at > LOGIN_VALID_MS) loginVerified.delete(u);
+}, 60 * 1000).unref();
+
+function parseUserId(s, pos = 0) {
+  const { value, next } = decodeLenLen(s, pos);
+  return { userId: String(value), next };
+}
+function parseCmd(s, pos) {
+  const { value, next } = decodeLen(s, pos);
+  return { cmd: value, next };
+}
+
+async function sendCloud(setter, name, value) {
+  await setter(name, String(value));
+  await sleep(SEND_INTERVAL);
+}
+
+// CMD=10〜19のデータを全件送り終えたことをクライアントに知らせる（基礎データのみ）
+async function sendEndMarker(setter, userId) {
+  await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.END_MARKER));
+}
+
+async function sendEncodedItems(setter, userId, cmd, items) {
+  const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
+  const maxLen = 1000;
+  let buffer = "";
+  for (const item of items) {
+    if (buffer.length > 0 && (header + buffer + item).length > maxLen) {
+      await sendCloud(setter, randomCloud(), header + buffer);
+      buffer = "";
+    }
+    buffer += item;
+  }
+  if (buffer.length > 0) {
+    await sendCloud(setter, randomCloud(), header + buffer);
+  }
+}
+
+function encodeCourseInfo(row, index, isOfficial) {
+  const clearRate = row.attempt_count > 0
+    ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
+    : 0;
+  const clearRateEncoded = Math.round(clearRate * 100);
+  return encodeLen(index)
+    + encodeLen(row.like_count)
+    + encodeLen(row.play_count)
+    + encodeLen(clearRateEncoded)
+    + encodeText(row.title)
+    + encodeAlphabet(row.id)
+    + encodeAlphabet(row.author)
+    + encodeLen(row.posted_at)
+    + encodeLen(isOfficial ? 1 : 0)
+    + encodeLen(row.red ? 1 : 0);
+}
+
+async function sendCourseList(setter, userId, cmd, rows) {
+  const officialSet = new Set((await db.pool.query("SELECT name FROM official_makers")).rows.map(r => r.name));
+  const items = rows.map((row, i) => encodeCourseInfo(row, i + 1, officialSet.has(row.author)));
+  await sendEncodedItems(setter, userId, cmd, items);
+}
+
+// CMD=16,17,19共通: 何番目(Len) + author(alphabet) + 職人ポイント(Len)
+//   + 直近投稿日(LenLen) + 公式ユーザー(Len, 1/0)
+// ※いいね数・プレイ数は送らない
+function encodeMakerRankRow(row, index) {
+  return encodeLen(index)
+    + encodeAlphabet(row.author)
+    + encodeLen(Math.round(row.point))
+    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    + encodeLen(row.is_official ? 1 : 0);
+}
+
+// CMD=82,83共通: 順位(Len) + author(alphabet) + 勝利数(Len) + レート(Len)
+//   CMD=82の勝利数は週間の勝利数、CMD=83の勝利数は全期間の勝利数
+function encodeBattleRankRow(row, index) {
+  return encodeLen(index)
+    + encodeAlphabet(row.author)
+    + encodeLen(row.wins)
+    + encodeLen(row.rating);
+}
+
+async function sendBattleRankingList(setter, userId, cmd, rows) {
+  const items = rows.map((row, i) => encodeBattleRankRow(row, i + 1));
+  await sendEncodedItems(setter, userId, cmd, items);
+}
+
+async function sendMakerRankingList(setter, userId, cmd, rows) {
+  const items = rows.map((row, i) => encodeMakerRankRow(row, i + 1));
+  await sendEncodedItems(setter, userId, cmd, items);
+}
+
+// CMD=18: author(alphabet) + 職人ポイント(全期間)(Len) + 総いいね数(Len) + 総プレイ数(Len)
+//   + 全体順位(Len) + 週間順位(Len) + 直近投稿日(LenLen、未投稿の場合は-1) + 公式ユーザー(Len, 1/0) + 投稿コース数(Len)
+function encodeMakerInfo(row) {
+  const latestPostedEncoded = row.latest_posted_at > 0
+    ? encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    : encodeLenLen(-1);
+  return encodeAlphabet(row.author)
+    + encodeLen(row.maker_point)
+    + encodeLen(row.total_likes)
+    + encodeLen(row.total_plays)
+    + encodeLen(row.all_time_rank)
+    + encodeLen(row.weekly_rank)
+    + latestPostedEncoded
+    + encodeLen(row.is_official ? 1 : 0)
+    + encodeLen(row.total_courses);
+}
+
+async function sendCourseData(setter, userId, stageData) {
+  const headerBase = encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_COURSE);
+  const maxLen = 1000;
+  const overhead = headerBase.length + 2 + 2;
+  const chunkSize = maxLen - overhead;
+  const totalChunks = Math.ceil(stageData.length / chunkSize);
+  const totalEnc = encodeLen(totalChunks);
+  for (let i = 0; i < totalChunks; i++) {
+    const seq = i + 1;
+    const chunk = stageData.slice(i * chunkSize, (i + 1) * chunkSize);
+    await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(seq) + chunk);
+  }
+  await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(0));
+}
+
+function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
+function isValidStr(value) { return typeof value === "string" && value.length > 0; }
+
+async function handleRequest(s, setter, getOnlineUsers) {
+  let pos = 0;
+  const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
+  if (!userId || isNaN(parseInt(userId))) { console.warn("⚠️ 不正なユーザーID:", userId); return; }
+  const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
+  if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
+
+  let username;
+  try {
+    const { value, next } = decodeAlphabet(s, pos);
+    username = value;
+    pos = next;
+  } catch (e) {
+    if (cmd === CMD.GET_STATS) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
+      return;
+    }
+    console.warn("⚠️ usernameデコード失敗:", e.message); return;
+  }
+  if (!isValidStr(username)) {
+    if (cmd === CMD.GET_STATS) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
+      return;
+    }
+    console.warn("⚠️ 不正なusername:", username); return;
+  }
+
+  // CMD=2: コース削除（CMD=54でログイン成功してから5分以内のみ有効）
+  if (cmd === CMD.DELETE_COURSE) {
+    const { value: courseId } = decodeAlphabet(s, pos);
+    let success = false;
+    const login = getValidLogin(username);
+    if (!login) {
+      console.warn(`⚠️ 削除拒否(CMD=54未認証/期限切れ): ${username}`);
+    } else if (isValidStr(courseId)) {
+      try {
+        if (DELETE_REQUIRE_AUTHOR_MATCH) {
+          const course = await db.getCourseById(courseId);
+          if (course && course.author === login.author) {
+            success = !!(await db.deleteCourse(courseId));
+          } else {
+            console.warn(`⚠️ 削除拒否(作者不一致): ${username} -> ${courseId}`);
+          }
+        } else {
+          success = !!(await db.deleteCourse(courseId));
+        }
+      } catch (e) {
+        console.error("コース削除失敗:", e.message);
+        success = false;
+      }
+    }
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.DELETE_COURSE) + encodeLen(success ? 1 : 0));
+    return;
+  }
+
+  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL || cmd === CMD.RECOMMENDED) {
+    const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    let rows;
+    if      (cmd === CMD.RANDOM)      rows = await db.getRandomCourses(limit);
+    else if (cmd === CMD.WEEKLY)      rows = await db.getWeeklyRanking(limit);
+    else if (cmd === CMD.NEW_ARRIVAL) rows = await db.getNewArrivalCourses(limit);
+    else if (cmd === CMD.RECOMMENDED) rows = await db.getRecommendedCourses(limit);
+    else                               rows = await db.getAllTimeRanking(limit);
+    await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  if (cmd === CMD.SEARCH_ID) {
+    const { value: courseId } = decodeAlphabet(s, pos);
+    if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
+    const rows = await db.searchByCourseId(courseId);
+    if (!rows.length) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  if (cmd === CMD.SEARCH_AUTHOR) {
+    const { value: author, next: p3 } = decodeAlphabet(s, pos); pos = p3;
+    if (!isValidStr(author)) { console.warn("⚠️ 不正なauthor:", author); return; }
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = await db.searchByAuthor(author, limit);
+    if (!rows.length) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  if (cmd === CMD.MAKER_RANK_WEEK || cmd === CMD.MAKER_RANK_ALL) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = cmd === CMD.MAKER_RANK_WEEK
+      ? await db.getMakerRankingWeek(limit)
+      : await db.getMakerRankingAllTime(limit);
+    await sendMakerRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  if (cmd === CMD.MAKER_INFO) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const info = await db.getMakerInfo(targetAuthor);
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId)) + encodeLen(CMD.MAKER_INFO) + encodeMakerInfo(info);
+    await sendCloud(setter, randomCloud(), payload);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  // CMD=80: オンライン対戦の職人情報
+  // リクエスト: 基礎データ(userId + cmd + username) + 職人名(alphabet)
+  // 返信: userId(LenLen) + cmd(Len) + バトルレート(Len) + 週間バトルランキング順位(Len)
+  //        + 全週間バトルランキング順位(Len) + 総試合数(Len) + 勝利回数(Len)
+  // 対象の職人が存在しない場合は CMD=300 を返す（CMD=18と同じ）
+  if (cmd === CMD.GET_ONLINE_MAKER_INFO) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const info = await db.getOnlineMakerInfo(targetAuthor);
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_ONLINE_MAKER_INFO)
+      + encodeLen(info.rating)
+      + encodeLen(info.weekly_rank)
+      + encodeLen(info.all_rank)
+      + encodeLen(info.matches)
+      + encodeLen(info.wins);
+    await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  // CMD=81 start_course-loading: ルームのコースデータを、ルーム全員へ一斉送信する
+  // リクエスト: 基礎データ(userId + cmd + username) + ルームID(Len)。ルームホスト（最初にルームを立ち上げたユーザー）が送る。
+  // 返信: CMD=30(GET_COURSE)と同じ形式のコースデータ。ただし userId の部分を「ルームID」にして送る。
+  //       （ルームIDあてに送るので、ホスト以外の参加者も同時に受信できる）
+  // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく（CMD=84と同じコースになる）。
+  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
+  if (cmd === CMD.START_COURSE_LOADING) {
+    const { value: roomId } = decodeLen(s, pos);
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    const courseId = await db.getBattleRoomCourse(roomId);
+    const row = courseId ? await db.getCourseById(courseId) : null;
+    if (!row) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
+      return;
+    }
+    await sendCourseData(setter, roomId, row.stage_data);
+    return;
+  }
+
+  // CMD=84 get_onlinecourse_info: ルームのコースの基本情報を、ルーム全員へ一斉送信する
+  // リクエスト: 基礎データ + ルームID(Len)。ルームホストが送る。
+  // 返信: roomId(LenLen) + cmd(Len) + コースのタイトル(text) + コースを作った職人名(alphabet)
+  //       （userId の部分を「ルームID」にして送る。コースはCMD=81と同じルームのコース）
+  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
+  if (cmd === CMD.GET_ONLINECOURSE_INFO) {
+    const { value: roomId } = decodeLen(s, pos);
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    const courseId = await db.getBattleRoomCourse(roomId);
+    const info = courseId ? await db.getCourseBasicInfo(courseId) : null;
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
+      return;
+    }
+    await sendCloud(setter, randomCloud(),
+      encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(info.title) + encodeAlphabet(info.author));
+    return;
+  }
+
+  // CMD=82: 週間バトルランキング / CMD=83: 全期間バトルランキング
+  // リクエスト: 基礎データ + 最大件数(Len)
+  // 返信: CMD=16と同じく、1行ごとに 順位(Len) + 職人名(alphabet) + 勝利数(Len) + レート(Len) を並べて送り、最後にCMD=1000を送る
+  if (cmd === CMD.BATTLE_RANK_WEEK || cmd === CMD.BATTLE_RANK_ALL) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = cmd === CMD.BATTLE_RANK_WEEK
+      ? await db.getBattleRankingWeek(limit)
+      : await db.getBattleRankingAll(limit);
+    await sendBattleRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  if (cmd === CMD.OFFICIAL_MAKER) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = await db.getOfficialMakers(limit);
+    await sendMakerRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
+  // CMD=55: パスワード暗号化用のノンスを発行して返す（リクエストは userId + cmd + username のみ）
+  // 返信: userId(LenLen) + cmd(Len) + nonce(alphabet、0-9a-zの8文字)
+  if (cmd === CMD.GET_NONCE) {
+    const nonce = issueNonce(username);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_NONCE) + encodeAlphabet(nonce));
+    return;
+  }
+
+  if (cmd === CMD.REGISTER_CHECK_AUTHOR) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    let result;
+    if (await db.isAuthorConfirmed(targetAuthor)) result = 3;
+    else if (await db.isAuthorUsedBeforeCutoff(targetAuthor)) result = 1;
+    else result = 2;
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_AUTHOR) + encodeLen(result));
+    return;
+  }
+
+  if (cmd === CMD.REGISTER_CHECK_USERNAME) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: targetUsername } = decodeAlphabet(s, q1);
+    if (!isValidStr(targetAuthor) || !isValidStr(targetUsername)) {
+      console.warn("⚠️ 不正な入力:", targetAuthor, targetUsername); return;
+    }
+    const used = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, targetUsername);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_USERNAME) + encodeLen(used ? 1 : 0));
+    return;
+  }
+
+  if (cmd === CMD.REGISTER_SUBMIT) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: encryptedPassword, next: q2 } = decodeAlphabet(s, q1);
+    const { value: regType } = decodeLen(s, q2);
+    if (!isValidStr(targetAuthor) || !isValidStr(encryptedPassword) || !isValidNum(regType)) {
+      console.warn("⚠️ 不正な登録リクエスト"); return;
+    }
+
+    // BANされているユーザー名は職人登録できない（本登録・仮登録とも）。LIKEのBANと同じくCMD=405を返す
+    if (await db.isUserBanned(username)) {
+      console.warn(`⚠️ BAN中のユーザー名の職人登録を拒否: ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
+      return;
+    }
+
+    // 暗号文の形式(0-9a-zの48文字)でなければ、暗号化されていないパスワードとみなして409を返す
+    if (!pwcrypt.isCipherFormat(encryptedPassword)) {
+      console.warn(`⚠️ 暗号化されていないパスワード(登録): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
+    }
+
+    // パスワードは暗号化されて届く。CMD=55で発行したノンス（1回限り）で復号する
+    const password = decryptPasswordWithNonce(username, encryptedPassword);
+    if (password === null) {
+      console.warn(`⚠️ パスワード復号失敗(登録): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      return;
+    }
+
+    if (regType === 0) {
+      if (await db.hasRegisteredToday(username)) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+      try {
+        await db.registerMakerConfirmed(targetAuthor, username, password);
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+      } catch (e) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      }
+      return;
+    } else {
+      if (await db.hasRegisteredToday(username)) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+      const confirmed = await db.isAuthorConfirmed(targetAuthor);
+      if (confirmed) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+
+      const hasUsed = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, username);
+      if (hasUsed) {
+        try {
+          await db.registerMakerConfirmed(targetAuthor, username, password);
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+        } catch (e) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        }
+        return;
+      }
+
+      await db.registerMakerPending(targetAuthor, username, password);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
+      return;
+    }
+  }
+
+  if (cmd === CMD.REGISTER_STATUS) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const status = await db.getMakerStatus(targetAuthor);
+    const result = status === "confirmed" ? 1 : status === "pending" ? 2 : 3;
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_STATUS) + encodeLen(result));
+    return;
+  }
+
+  if (cmd === CMD.REGISTER_LOGIN) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: encryptedPassword } = decodeAlphabet(s, q1);
+    if (!isValidStr(targetAuthor) || !isValidStr(encryptedPassword)) { console.warn("⚠️ 不正なログイン要求"); return; }
+
+    // 暗号文の形式(0-9a-zの48文字)でなければ、暗号化されていないパスワードとみなして409を返す
+    if (!pwcrypt.isCipherFormat(encryptedPassword)) {
+      console.warn(`⚠️ 暗号化されていないパスワード(ログイン): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
+    }
+
+    // パスワードは暗号化されて届く。CMD=55で発行したノンス（1回限り）で復号してから照合する
+    const password = decryptPasswordWithNonce(username, encryptedPassword);
+    if (password === null) {
+      console.warn(`⚠️ パスワード復号失敗(ログイン): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(0));
+      return;
+    }
+    const ok = await db.verifyMakerPassword(targetAuthor, password);
+    if (ok) recordLoginSuccess(username, targetAuthor); // CMD=2の認可用に記録（5分間有効）
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(ok ? 1 : 0));
+    return;
+  }
+
+  if (cmd === CMD.LIKE || cmd === CMD.PLAY || cmd === CMD.ATTEMPT || cmd === CMD.CLEAR) {
+    const { value: courseId } = decodeAlphabet(s, pos);
+    if (!isValidStr(courseId)) {
+      console.warn("⚠️ 不正なcourseId:", courseId); return;
+    }
+    // 自作コース（コースの投稿ユーザー名＝リクエストのusername）は加算しない。返信もしない。
+    // 判定はDB側のUPDATE条件(username <> 自分)で行うので、追加のクエリは発生しない。
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId, username); await db.incrementAttempt(courseId, username); return; }
+    if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId, username); return; }
+    if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId, username);   return; }
+    if (cmd === CMD.LIKE) {
+      const banned = await db.isUserBanned(username);
+      if (banned) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
+        return;
+      }
+      const course = await db.getCourseById(courseId);
+      if (course && course.username === username) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
+        return;
+      }
+      if (course) {
+        const since = Math.floor(Date.now() / 1000) - 30 * 60;
+        const recentCount = await db.countRecentLikesForAuthor(username, course.author, since);
+        if (recentCount >= 3) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(202));
+          return;
+        }
+      }
+      const { alreadyLiked } = await db.addLike(username, courseId);
+      if (alreadyLiked) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
+      } else {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(201));
+      }
+      return;
+    }
+  }
+
+  if (cmd === CMD.GET_COURSE) {
+    const { value: courseId } = decodeAlphabet(s, pos);
+    if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
+    const row = await db.getCourseById(courseId);
+    if (!row) return;
+    await sendCourseData(setter, userId, row.stage_data);
+    return;
+  }
+
+  if (cmd === CMD.GET_NOTIFY) {
+    const notification = await db.getAndDeleteNotification(username);
+    if (notification) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(notification.cmd));
+    } else {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(500));
+    }
+    return;
+  }
+
+  if (cmd === CMD.GET_STATS) {
+    const stats = await db.getStats();
+    const businessDay = db.getBusinessDayForDisplay();
+    const dailyActiveUsers = await db.countDailyActiveUsers(businessDay).catch(() => 0);
+    const onlineNow = getOnlineUsers();
+    const peaks = await db.getOnlinePeaks().catch(() => ({ dayPeak: 0, allPeak: 0 }));
+    const weeklyActiveUsers = await db.countWeeklyActiveUsers(businessDay).catch(() => 0);
+    const registeredMakers = await db.countRegisteredMakers().catch(() => 0);
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_STATS)
+      + encodeLen(parseInt(stats.total_courses))
+      + encodeLen(parseInt(stats.total_plays))
+      + encodeLen(parseInt(stats.total_likes))
+      + encodeLen(parseInt(stats.total_clears))
+      + encodeLen(parseInt(stats.total_attempts))
+      + encodeLen(parseInt(stats.weekly_courses))
+      + encodeLen(getOnlineUsers())
+      + encodeLen(dailyActiveUsers || 0)
+      // ここから追加分（既存の項目の後ろに続けて送る）
+      + encodeLen(Math.max(peaks.dayPeak || 0, onlineNow))   // 本日(営業日)の最大同接数
+      + encodeLen(Math.max(peaks.allPeak || 0, onlineNow))   // 全期間の最大同接数
+      + encodeLen(weeklyActiveUsers || 0)                     // 週間アクティブユーザー数（直近7営業日）
+      + encodeLen(registeredMakers || 0);                     // 登録職人数
+    await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  if (cmd === CMD.GET_ANNOUNCEMENT) {
+    const announcement = await db.getLatestAnnouncement();
+    if (!announcement) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_ANNOUNCEMENT)
+      + encodeText(announcement.title)
+      + encodeLenLen(minutesToDateTimeInt(announcement.created_at))
+      + encodeText(announcement.body);
+    await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  if (cmd === CMD.BAN_USERNAME) {
+    const alreadyBanned = await db.isUserBanned(username);
+    if (!alreadyBanned) {
+      const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
+      await db.banUser(username, expiresAt);
+      console.log(`🔨 自動BAN: ${username}`);
+    }
+    return;
+  }
+
+  console.warn("⚠️ 未知のコマンドコード:", cmd);
+}
+
+const uploadBuffers = new Map();
+const UPLOAD_TIMEOUT = 60 * 1000;
+
+async function handleUploadChunk(s, setter) {
+  let pos = 0;
+  const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
+  const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
+  if (cmd !== CMD.UPLOAD) return;
+
+  const { value: username, next: p3 } = decodeAlphabet(s, pos); pos = p3;
+  if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
+
+  const banned = await db.isUserBanned(username);
+  if (banned) {
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(103));
+    return;
+  }
+
+  const { value: totalChunks, next: p4 } = decodeLen(s, pos); pos = p4;
+  const { value: seq, next: p5 } = decodeLen(s, pos); pos = p5;
+
+  if (!uploadBuffers.has(userId)) {
+    const timer = setTimeout(() => uploadBuffers.delete(userId), UPLOAD_TIMEOUT);
+    uploadBuffers.set(userId, { totalChunks, chunks: new Map(), timer, username });
+  }
+  const buf = uploadBuffers.get(userId);
+  buf.totalChunks = totalChunks;
+  buf.username = username;
+
+  if (seq === 0) {
+    const { value: title, next: p6 } = decodeText(s, pos); pos = p6;
+    const { value: author } = decodeAlphabet(s, pos);
+    buf.title  = title;
+    buf.author = author;
+
+    let allPresent = true;
+    for (let i = 1; i <= buf.totalChunks; i++) {
+      if (!buf.chunks.has(i)) { allPresent = false; break; }
+    }
+    clearTimeout(buf.timer);
+    uploadBuffers.delete(userId);
+
+    if (allPresent) {
+      let stageData = "";
+      for (let i = 1; i <= totalChunks; i++) stageData += buf.chunks.get(i);
+      try {
+        const result = await db.saveCourse(buf.title, buf.author, buf.username, stageData);
+        if (result.duplicate) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
+        } else if (result.tooSoon) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
+        } else if (result.limitReached) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(105));
+        } else {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id));
+        }
+      } catch (e) {
+        console.error("コース保存失敗:", e.message);
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
+      }
+    } else {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
+    }
+  } else {
+    buf.chunks.set(seq, s.slice(pos));
+  }
+}
+
+// 使用不可CMDを受信したときにCMD=1001を返す
+async function replyCmdDisabled(s, pos, cmd, userId, setter) {
+  if (cmd === CMD.UPLOAD) {
+    // 投稿は分割送信なので、最終パケット(seq=0)のときだけ1回返す
+    try {
+      const { next: a } = decodeAlphabet(s, pos);   // username
+      const { next: b } = decodeLen(s, a);          // totalChunks
+      const { value: seq } = decodeLen(s, b);       // seq
+      if (seq !== 0) return;
+    } catch (_) { return; }
+  }
+  await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.DISABLED));
+}
+
+// リクエスト内のusernameが、管理者が発行した特別ユーザー名かどうか
+// （usernameはcmdの直後に必ず入っている。デコードに失敗したら特別ユーザーではない）
+async function isBypassUser(s, pos) {
+  try {
+    const { value: username } = decodeAlphabet(s, pos);
+    if (!isValidStr(username)) return false;
+    const bypass = await db.getBypassUsername();
+    return !!bypass && username === bypass;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function onMessage(name, value, setter, getOnlineUsers) {
+  const s = String(value);
+  if (!s || s.length < 3) return;
+  try {
+    const { userId, next: p0 } = parseUserId(s, 0);
+    const { cmd, next: p1 }    = parseCmd(s, p0);
+    const isUpload = cmd === CMD.UPLOAD;
+    if (!isUpload && !REQUEST_VARS.includes(name)) return;
+    if (!userId || isNaN(parseInt(userId))) return;
+
+    // 使用不可CMDでも、特別ユーザー名(メンテナンス用)からのリクエストは通す
+    if (await db.isCmdDisabled(cmd) && !(await isBypassUser(s, p1))) {
+      await replyCmdDisabled(s, p1, cmd, userId, setter);
+      return;
+    }
+
+    if (isUpload) await handleUploadChunk(s, setter);
+    else          await handleRequest(s, setter, getOnlineUsers);
+  } catch (e) {
+    console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
+  }
+}
+
+function checkAuth(req) {
+  const auth = req.headers["authorization"] || "";
+  const b64  = auth.replace(/^Basic /, "");
+  const decoded = Buffer.from(b64, "base64").toString("utf8");
+  const [, pass] = decoded.split(":");
+  return pass === ADMIN_PASSWORD;
+}
+
+async function handleManageAPI(req, res) {
+  if (!checkAuth(req)) {
+    res.writeHead(401, { "WWW-Authenticate": 'Basic realm="manage"', "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  const url = new URL(req.url, `http://localhost`);
+  const pathname = url.pathname;
+
+  if (req.method === "POST" && pathname === "/api/delete-course") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { courseId, reason } = JSON.parse(body);
+        if (!courseId || !reason) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "courseId, reason は必須です" }));
+          return;
+        }
+        const deleted = await db.deleteCourse(courseId);
+        if (!deleted) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "コースが見つかりません" }));
+          return;
+        }
+        await db.upsertNotification(deleted.username, reason);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/ban-user") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { username, duration } = JSON.parse(body);
+        if (!username || !duration) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "username, duration は必須です" }));
+          return;
+        }
+        const expiresAt = Math.floor(Date.now() / 1000) + parseInt(duration, 10);
+        await db.banUser(username, expiresAt);
+        await db.upsertNotification(username, 400);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/pending-makers") {
+    try {
+      const makers = await db.listPendingMakers();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, makers }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/approve-maker") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.approvePendingMaker(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/reject-maker") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.rejectPendingMaker(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/chat-reports (未解決の通報一覧)
+  if (req.method === "GET" && pathname === "/api/chat-reports") {
+    try {
+      const reports = await db.listChatReports();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, reports }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/chat-resolve-report
+  if (req.method === "POST" && pathname === "/api/chat-resolve-report") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.resolveChatReport(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/chat-ban (チャットからのみBAN。ゲーム内投稿等には影響しない)
+  if (req.method === "POST" && pathname === "/api/chat-ban") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author, duration, reason } = JSON.parse(body);
+        if (!author || !duration) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author, duration は必須です" }));
+          return;
+        }
+        const expiresAt = Math.floor(Date.now() / 1000) + parseInt(duration, 10);
+        await db.banChatAuthor(author, expiresAt, reason || null);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/banned-words (禁止ワード一覧)
+  if (req.method === "GET" && pathname === "/api/banned-words") {
+    try {
+      const words = await db.listBannedWords();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, words }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/banned-words (禁止ワード追加)
+  if (req.method === "POST" && pathname === "/api/banned-words") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { word } = JSON.parse(body);
+        if (!word || typeof word !== "string" || !word.trim()) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "word は必須です" }));
+          return;
+        }
+        await db.addBannedWord(word.trim());
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/banned-words-delete (禁止ワード削除)
+  if (req.method === "POST" && pathname === "/api/banned-words-delete") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { word } = JSON.parse(body);
+        if (!word) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "word は必須です" }));
+          return;
+        }
+        const ok = await db.removeBannedWord(word);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/like-fraud-incidents (不正いいね自動検知の履歴一覧)
+  if (req.method === "GET" && pathname === "/api/like-fraud-incidents") {
+    try {
+      const incidents = await db.listLikeFraudIncidents(100);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, incidents }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/like-fraud-scan-now (不正いいね検知を今すぐ手動実行)
+  if (req.method === "POST" && pathname === "/api/like-fraud-scan-now") {
+    try {
+      const results = await db.detectAndCleanSuspiciousLikes();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/chat-unban (チャットBANの解除。自動検知の誤検知対応など)
+  if (req.method === "POST" && pathname === "/api/chat-unban") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author } = JSON.parse(body);
+        if (!author) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author は必須です" }));
+          return;
+        }
+        const ok = await db.unbanChatAuthor(author);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/disabled-cmds (使用不可CMD一覧)
+  if (req.method === "GET" && pathname === "/api/disabled-cmds") {
+    try {
+      const cmds = await db.listDisabledCmds();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, cmds, known: KNOWN_CMDS }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/disabled-cmds (使用不可CMDを追加)
+  if (req.method === "POST" && pathname === "/api/disabled-cmds") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { cmd } = JSON.parse(body);
+        if (!Number.isInteger(cmd) || !Object.values(KNOWN_CMDS).includes(cmd)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "不正なCMDです" }));
+          return;
+        }
+        await db.addDisabledCmd(cmd);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/disabled-cmds-delete (使用不可CMDを解除)
+  if (req.method === "POST" && pathname === "/api/disabled-cmds-delete") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { cmd } = JSON.parse(body);
+        if (!Number.isInteger(cmd)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "cmd は必須です" }));
+          return;
+        }
+        const ok = await db.removeDisabledCmd(cmd);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/bypass-username (現在の特別ユーザー名)
+  if (req.method === "GET" && pathname === "/api/bypass-username") {
+    try {
+      const info = await db.getBypassInfo();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, username: info ? info.username : null, issued_at: info ? info.issued_at : null }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/bypass-username (発行・再発行。前の特別ユーザー名は無効になる)
+  if (req.method === "POST" && pathname === "/api/bypass-username") {
+    try {
+      const info = await db.issueBypassUsername();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, username: info.username, issued_at: info.issued_at }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/bypass-username-delete (特別ユーザー名を削除。メンテナンス終了時用)
+  if (req.method === "POST" && pathname === "/api/bypass-username-delete") {
+    try {
+      const ok = await db.clearBypassUsername();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/disposable-like-courses?limit=50 (使い捨てユーザーからのいいねが多いコース一覧)
+  if (req.method === "GET" && pathname === "/api/disposable-like-courses") {
+    try {
+      let limit = parseInt(url.searchParams.get("limit") || "50", 10);
+      if (!Number.isInteger(limit) || limit <= 0) limit = 50;
+      limit = Math.min(limit, 200);
+      const courses = await db.listCoursesByDisposableLikers(limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, courses }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/author-likers?limit=50 (職人ごとの、いいねしたユーザー名の人数集計)
+  if (req.method === "GET" && pathname === "/api/author-likers") {
+    try {
+      let limit = parseInt(url.searchParams.get("limit") || "50", 10);
+      if (!Number.isInteger(limit) || limit <= 0) limit = 50;
+      limit = Math.min(limit, 200);
+      const summary = await db.listAuthorLikerSummary(limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...summary }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/author-likers-detail?author=xxx (指定した職人のコースにいいねしたユーザー名一覧)
+  if (req.method === "GET" && pathname === "/api/author-likers-detail") {
+    try {
+      const author = url.searchParams.get("author");
+      if (!isValidStr(author)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "author は必須です" }));
+        return;
+      }
+      const likers = await db.listLikersForAuthor(author);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, author, likers }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/purge-author-likes { author, dryRun, username? }
+  // 指定職人のコースについた不正分いいね（その職人名で投稿したユーザー名 / 投稿履歴のないユーザー名）を削除する。
+  // username を指定すると、そのユーザー名のいいねだけを対象にする（削除対象でなければ何も削除しない）。
+  // dryRun=true のときは件数だけ返して何も削除しない。
+  if (req.method === "POST" && pathname === "/api/purge-author-likes") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author, dryRun, username } = JSON.parse(body);
+        if (!isValidStr(author)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author は必須です" }));
+          return;
+        }
+        if (username !== undefined && username !== null && !isValidStr(username)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "username は文字列で指定してください" }));
+          return;
+        }
+        const onlyUsername = isValidStr(username) ? username : null;
+        const result = await db.purgeSuspiciousLikesForAuthor(author, dryRun === true, onlyUsername);
+        if (!result.dry_run) {
+          console.log(`🧹 手動で不正いいねを削除: author=${author}${onlyUsername ? " username=" + onlyUsername : ""} removed=${result.removed_count}`);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/like-fraud-incident-likes?id=N (検知履歴1件で削除したいいねの、ユーザー名ごとの内訳)
+  if (req.method === "GET" && pathname === "/api/like-fraud-incident-likes") {
+    try {
+      const id = parseInt(url.searchParams.get("id") || "", 10);
+      if (!Number.isInteger(id)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "id は必須です" }));
+        return;
+      }
+      const users = await db.listIncidentDeletedLikes(id);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, users }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/restore-likes { incidentId, username? }
+  // 自動削除したいいねを復元する。username を指定するとそのユーザー名のぶんだけ復元する。
+  if (req.method === "POST" && pathname === "/api/restore-likes") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { incidentId, username } = JSON.parse(body);
+        if (!Number.isInteger(incidentId)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "incidentId は必須です" }));
+          return;
+        }
+        const onlyUsername = isValidStr(username) ? username : null;
+        const result = await db.restoreDeletedLikes(incidentId, onlyUsername);
+        console.log(`♻️ 自動削除したいいねを復元: incident=${incidentId}${onlyUsername ? " username=" + onlyUsername : ""} restored=${result.restored_count}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
+}
+
+// ─────────────────────────────────────────────
+// 職人チャット用 公開API（Basic認証不要、トークン認証）
+// ─────────────────────────────────────────────
+
+// 連投対策: authorごとに直近送信時刻を記録し、最小送信間隔を強制する
+const chatLastSentAt = new Map();
+const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
+const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
+const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
+const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
+
+// 通報の連投対策: 通報者ごとに直近の通報時刻を記録し、最短間隔を強制する
+const chatReportLastAt = new Map();
+const CHAT_REPORT_COOLDOWN_MS = 10 * 60 * 1000; // 通報のクールダウン（10分）
+
+// ── サービス終了 ──
+// 2026年10月20日 午前3時(JST)以降は、全体チャット・DMの新規メッセージをすべて拒否する
+const CHAT_SERVICE_END_AT = Date.parse("2026-10-20T03:00:00+09:00");
+const CHAT_SERVICE_END_MESSAGE = "職人チャットは2026年10/20をもってサービスを終了しました。ご利用ありがとうございました。";
+
+/** サービス終了時刻(JST 2026/10/20 3:00)を過ぎているかどうか */
+function isChatServiceEnded() {
+  return Date.now() >= CHAT_SERVICE_END_AT;
+}
+
+/** 終了後は送信を拒否して終了メッセージを返す。拒否した場合 true */
+function rejectIfChatServiceEnded(res) {
+  if (!isChatServiceEnded()) return false;
+  sendJson(res, 403, {
+    error: CHAT_SERVICE_END_MESSAGE,
+    code: "service_ended",
+    message: CHAT_SERVICE_END_MESSAGE,
+  });
+  return true;
+}
+
+/** 現在が深夜停止時間帯(JST 1:00〜6:00)かどうか */
+function isChatNightMode() {
+  const jstHour = parseInt(
+    new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo", hour: "2-digit", hourCycle: "h23" }).format(new Date()),
+    10
+  );
+  return jstHour >= CHAT_NIGHT_START_HOUR && jstHour < CHAT_NIGHT_END_HOUR;
+}
+
+// ── 禁止ワード（NGワード）チェック ──
+// 単語リストはコードに直書きせず、DB(chat_banned_words)で管理する。管理ページから追加・削除できる。
+function normalizeForBanCheck(text) {
+  // 全角/半角・大文字小文字の表記ゆれを吸収してから比較する
+  return text.normalize("NFKC").toLowerCase();
+}
+
+async function containsBannedWord(text) {
+  const words = await db.listBannedWords();
+  if (!words.length) return false;
+  const normalizedText = normalizeForBanCheck(text);
+  return words.some(w => normalizedText.includes(normalizeForBanCheck(w)));
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", d => { body += d; if (body.length > 1e6) req.destroy(); });
+    req.on("end", () => {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function getBearerToken(req) {
+  const auth = req.headers["authorization"] || "";
+  const m = auth.match(/^Bearer (.+)$/);
+  return m ? m[1] : null;
+}
+
+// RenderはプロキシごしなのでX-Forwarded-Forの先頭を実クライアントIPとして扱う
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return xff.split(",")[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+async function requireChatAuth(req, res) {
+  const token = getBearerToken(req);
+  const author = await db.getAuthorByToken(token);
+  if (!author) {
+    sendJson(res, 401, { error: "unauthorized" });
+    return null;
+  }
+  const banned = await db.isChatBanned(author);
+  if (banned) {
+    sendJson(res, 403, { error: "banned" });
+    return null;
+  }
+  return author;
+}
+
+async function handleChatAPI(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const pathname = url.pathname;
+
+  // POST /api/chat/login
+  if (req.method === "POST" && pathname === "/api/chat/login") {
+    try {
+      const { author, password } = await readJsonBody(req);
+      if (!isValidStr(author) || !isValidStr(password)) {
+        return sendJson(res, 400, { error: "author, password は必須です" });
+      }
+      const ip = getClientIp(req);
+      const result = await db.chatLogin(author, password, ip);
+      if (result.error) return sendJson(res, 401, { error: result.error });
+      return sendJson(res, 200, { ok: true, token: result.token, author: result.author });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/logout
+  if (req.method === "POST" && pathname === "/api/chat/logout") {
+    const token = getBearerToken(req);
+    if (token) await db.chatLogout(token);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // GET /api/chat/messages?after=ID  （全体チャットは誰でも閲覧可、ログイン不要）
+  // ログイン中の場合はトークンから確実に自分のメッセージかどうか(self)を判定して返す
+  if (req.method === "GET" && pathname === "/api/chat/messages") {
+    try {
+      const beforeId = parseInt(url.searchParams.get("before") || "0", 10);
+      const afterId = parseInt(url.searchParams.get("after") || "0", 10);
+      const token = getBearerToken(req);
+      const currentAuthor = token ? await db.getAuthorByToken(token) : null;
+      let messages;
+      if (beforeId > 0) {
+        // 「過去のメッセージを読み込む」: beforeIdより古いものをさかのぼって取得
+        messages = await db.getChatMessagesBefore(beforeId, 50);
+      } else if (afterId > 0) {
+        messages = await db.getChatMessages(afterId, 100);
+      } else {
+        // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+        messages = await db.getLatestChatMessages(50);
+      }
+      const enriched = messages.map(m => ({ ...m, self: currentAuthor ? m.author === currentAuthor : false }));
+      const deletedIds = beforeId > 0 ? [] : await db.getRecentlyDeletedChatIds(120);
+      return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/send  { text }  （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/send") {
+    if (rejectIfChatServiceEnded(res)) return;
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      if (isChatNightMode()) {
+        return sendJson(res, 403, { error: "night_mode" });
+      }
+      const { text } = await readJsonBody(req);
+      if (!isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
+        return sendJson(res, 400, { error: "不正なメッセージです" });
+      }
+      if (await containsBannedWord(text)) {
+        return sendJson(res, 400, { error: "inappropriate_content" });
+      }
+      const lastSent = chatLastSentAt.get(author) || 0;
+      if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
+        return sendJson(res, 429, { error: "送信間隔が短すぎます" });
+      }
+      const todayChars = await db.getDailyCharCount(author);
+      if (todayChars + text.length > CHAT_DAILY_CHAR_LIMIT) {
+        return sendJson(res, 400, { error: "daily_limit_exceeded" });
+      }
+      chatLastSentAt.set(author, Date.now());
+      const saved = await db.saveChatMessage(author, text.trim());
+      await db.addDailyCharCount(author, text.length);
+      return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/dm/partners （ログイン必須）
+  if (req.method === "GET" && pathname === "/api/chat/dm/partners") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const partners = await db.getDMPartners(author);
+      return sendJson(res, 200, { ok: true, partners });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/dm/messages?with=author&after=ID （ログイン必須）
+  // 送信者=自分のトークンかどうかで確実にself判定を行う
+  // このスレッドを開いた＝既読とみなし、既読位置を更新する（LINEのような未読数表示のため）
+  if (req.method === "GET" && pathname === "/api/chat/dm/messages") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const withAuthor = url.searchParams.get("with");
+      if (!isValidStr(withAuthor)) return sendJson(res, 400, { error: "withは必須です" });
+      const beforeId = parseInt(url.searchParams.get("before") || "0", 10);
+      const afterId = parseInt(url.searchParams.get("after") || "0", 10);
+      let messages;
+      if (beforeId > 0) {
+        // 「過去のメッセージを読み込む」: beforeIdより古いものをさかのぼって取得
+        messages = await db.getDMMessagesBefore(author, withAuthor, beforeId, 50);
+      } else if (afterId > 0) {
+        messages = await db.getDMMessages(author, withAuthor, afterId, 100);
+      } else {
+        // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+        messages = await db.getLatestDMMessages(author, withAuthor, 50);
+      }
+      const enriched = messages.map(m => ({ ...m, self: m.from === author }));
+      const deletedIds = beforeId > 0 ? [] : await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
+      if (beforeId === 0) await db.markDMRead(author, withAuthor); // 過去読み込み時は既読更新しない
+      return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/dm/send  { to, text } （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/dm/send") {
+    if (rejectIfChatServiceEnded(res)) return;
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      if (isChatNightMode()) {
+        return sendJson(res, 403, { error: "night_mode" });
+      }
+      const { to, text } = await readJsonBody(req);
+      if (!isValidStr(to) || !isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
+        return sendJson(res, 400, { error: "不正なメッセージです" });
+      }
+      if (to === author) return sendJson(res, 400, { error: "自分自身には送信できません" });
+      if (await db.isAuthorBlocked(author, to)) {
+        return sendJson(res, 403, { error: "blocked_recipient" });
+      }
+      if (await containsBannedWord(text)) {
+        return sendJson(res, 400, { error: "inappropriate_content" });
+      }
+      const lastSent = chatLastSentAt.get(author) || 0;
+      if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
+        return sendJson(res, 429, { error: "送信間隔が短すぎます" });
+      }
+      const todayChars = await db.getDailyCharCount(author);
+      if (todayChars + text.length > CHAT_DAILY_CHAR_LIMIT) {
+        return sendJson(res, 400, { error: "daily_limit_exceeded" });
+      }
+      chatLastSentAt.set(author, Date.now());
+      const saved = await db.saveDM(author, to, text.trim());
+      await db.addDailyCharCount(author, text.length);
+      return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/report  { target_author, reason } （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/report") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author, reason, message_id, kind } = await readJsonBody(req);
+      if (!isValidStr(target_author) || !isValidStr(reason)) {
+        return sendJson(res, 400, { error: "target_author, reason は必須です" });
+      }
+      const lastReportAt = chatReportLastAt.get(author) || 0;
+      if (Date.now() - lastReportAt < CHAT_REPORT_COOLDOWN_MS) {
+        return sendJson(res, 429, { error: "report_cooldown" });
+      }
+      const validKind = (kind === "global" || kind === "dm") ? kind : null;
+      const validMessageId = validKind && Number.isInteger(message_id) ? message_id : null;
+      const created = await db.createChatReport(author, target_author, reason.slice(0, 500), validKind, validMessageId);
+      if (!created) {
+        return sendJson(res, 400, { error: "already_reported" });
+      }
+      chatReportLastAt.set(author, Date.now());
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/delete  { id } （全体チャット・自分のメッセージのみ削除可）
+  if (req.method === "POST" && pathname === "/api/chat/delete") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { id } = await readJsonBody(req);
+      if (!id) return sendJson(res, 400, { error: "id は必須です" });
+      const ok = await db.deleteChatMessage(id, author);
+      return sendJson(res, 200, { ok });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/dm/delete  { id } （DM・自分のメッセージのみ削除可）
+  if (req.method === "POST" && pathname === "/api/chat/dm/delete") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { id } = await readJsonBody(req);
+      if (!id) return sendJson(res, 400, { error: "id は必須です" });
+      const ok = await db.deleteDMMessage(id, author);
+      return sendJson(res, 200, { ok });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/blocked （自分のブロック一覧）
+  if (req.method === "GET" && pathname === "/api/chat/blocked") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const blocked = await db.getBlockedAuthors(author);
+      return sendJson(res, 200, { ok: true, blocked });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/block  { target_author }
+  if (req.method === "POST" && pathname === "/api/chat/block") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author } = await readJsonBody(req);
+      if (!isValidStr(target_author)) return sendJson(res, 400, { error: "target_author は必須です" });
+      if (target_author === author) return sendJson(res, 400, { error: "自分自身はブロックできません" });
+      await db.blockAuthor(author, target_author);
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/unblock  { target_author }
+  if (req.method === "POST" && pathname === "/api/chat/unblock") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author } = await readJsonBody(req);
+      if (!isValidStr(target_author)) return sendJson(res, 400, { error: "target_author は必須です" });
+      await db.unblockAuthor(author, target_author);
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  sendJson(res, 404, { error: "not found" });
+}
+
+function httpsRequest(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { data += chunk; });
+      res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function scratchLogin(username, password) {
+  const csrfRes = await httpsRequest({
+    hostname: "scratch.mit.edu",
+    path: "/csrf_token/",
+    method: "GET",
+    headers: { "User-Agent": "MarioMakerServer/1.0" },
+  });
+  const csrfCookies = csrfRes.headers["set-cookie"] || [];
+  const csrfMatch = csrfCookies.map(c => c.match(/scratchcsrftoken=([^;]+)/)).find(Boolean);
+  if (!csrfMatch) throw new Error("CSRFトークン取得失敗");
+  const csrfToken = csrfMatch[1];
+
+  const bodyStr = JSON.stringify({ username, password });
+  const loginRes = await httpsRequest({
+    hostname: "scratch.mit.edu",
+    path: "/login/",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(bodyStr),
+      "X-CSRFToken": csrfToken,
+      "X-Requested-With": "XMLHttpRequest",
+      "Cookie": `scratchcsrftoken=${csrfToken}; scratchlanguage=en;`,
+      "Referer": "https://scratch.mit.edu",
+      "User-Agent": "MarioMakerServer/1.0",
+    },
+  }, bodyStr);
+
+  const loginCookies = loginRes.headers["set-cookie"] || [];
+  const sessionMatch = loginCookies.map(c => c.match(/scratchsessionsid="?([^;"]+)"?/)).find(Boolean);
+  if (!sessionMatch) {
+    throw new Error(`ログイン失敗(status ${loginRes.statusCode}): ${loginRes.body.slice(0, 200)}`);
+  }
+  return sessionMatch[1];
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}タイムアウト`)), ms)),
+  ]);
+}
+
+class CloudManager {
+  constructor() {
+    this.scratch    = { conn: null, isReconnecting: false, delay: 5000 };
+    this.turbowarp  = { conn: null, isReconnecting: false, delay: 2000 };
+    this.queue      = [];
+    this.processing = false;
+    this.recentUsers = new Map();
+    // 営業日ごとに、既にDB記録済みのusernameを覚えておき、無駄なDB書き込みを減らす
+    this.recordedBusinessDay = null;
+    this.recordedUsernamesToday = new Set();
+  }
+
+  // 営業日(6:00〜翌1:00)に訪れたユーザーとしてusernameをDBに記録する（fire-and-forget）
+  recordDailyVisit(username) {
+    const businessDay = db.getBusinessDayForRecording();
+    if (!businessDay) return; // 1:00〜5:59の空白時間は記録しない
+    if (businessDay !== this.recordedBusinessDay) {
+      // 営業日が切り替わったら、記録済みセットをリセットする
+      this.recordedBusinessDay = businessDay;
+      this.recordedUsernamesToday = new Set();
+    }
+    if (this.recordedUsernamesToday.has(username)) return; // このプロセス内では既に記録済み
+    this.recordedUsernamesToday.add(username);
+    db.recordDailyActiveUser(username, businessDay).catch(e => {
+      console.error("訪問ユーザー記録失敗:", e.message);
+    });
+  }
+
+  trackUser(s) {
+    try {
+      const { next: p1 } = parseUserId(s, 0);
+      const { cmd, next: p2 } = parseCmd(s, p1);
+      if (cmd === CMD.UPLOAD) {
+        const { value: username } = decodeAlphabet(s, p2);
+        if (isValidStr(username)) {
+          this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+          this.recordDailyVisit(username);
+          db.trackOnlinePeak(this.getOnlineUsers());
+        }
+        return;
+      }
+      const { value: username } = decodeAlphabet(s, p2);
+      if (isValidStr(username)) {
+        this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+        this.recordDailyVisit(username);
+        db.trackOnlinePeak(this.getOnlineUsers());
+      }
+    } catch (_) {}
+  }
+
+  getOnlineUsers() {
+    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
+    for (const [username, lastSeen] of this.recentUsers) {
+      if (lastSeen < cutoff) this.recentUsers.delete(username);
+    }
+    return this.recentUsers.size;
+  }
+
+  getOnlineUsernames() {
+    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
+    for (const [username, lastSeen] of this.recentUsers) {
+      if (lastSeen < cutoff) this.recentUsers.delete(username);
+    }
+    return Array.from(this.recentUsers.keys());
+  }
+
+  enqueue(name, value, setter) {
+    this.queue.push({ name, value, setter });
+    if (!this.processing) this.processQueue();
+  }
+
+  async processQueue() {
+    this.processing = true;
+    while (this.queue.length > 0) {
+      const { name, value, setter } = this.queue.shift();
+      this.trackUser(String(value));
+      await onMessage(name, value, setter, () => this.getOnlineUsers());
+    }
+    this.processing = false;
+  }
+
+  connectScratch() {
+    if (this.scratch.conn?.readyState === WebSocket.OPEN || this.scratch.isReconnecting) return;
+    this.scratch.isReconnecting = true;
+    console.log("🔄 Scratch Cloud 接続中...");
+
+    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratchログイン")
+      .then(sessionId => {
+        const ws = new WebSocket("wss://clouddata.scratch.mit.edu", {
+          headers: {
+            Cookie: `scratchsessionsid=${sessionId};`,
+            Origin: "https://scratch.mit.edu",
+            "User-Agent": "MarioMakerServer/1.0",
+          },
+        });
+
+        const connectTimeout = setTimeout(() => {
+          console.error("❌ Scratch WebSocket接続タイムアウト");
+          ws.terminate();
+        }, 15000);
+
+        const setter = (name, value) => {
+          if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Scratch切断"));
+          ws.send(JSON.stringify({ method: "set", name, value: String(value), user: USERNAME, project_id: PROJECT_ID }) + "\n");
+          return Promise.resolve();
+        };
+
+        ws.on("open", async () => {
+          clearTimeout(connectTimeout);
+          ws.send(JSON.stringify({ method: "handshake", user: USERNAME, project_id: PROJECT_ID }) + "\n");
+          this.scratch.conn  = ws;
+          this.scratch.delay = 5000;
+          this.scratch.isReconnecting = false;
+          console.log("✅ Scratch Cloud 接続成功（直接接続）");
+          console.log("🔄 Scratch クラウド変数を初期化中...");
+          for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
+          console.log("✅ Scratch クラウド変数初期化完了");
+        });
+
+        ws.on("message", raw => {
+          try {
+            const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
+            for (const line of text.trim().split("\n")) {
+              if (!line) continue;
+              const data = JSON.parse(line);
+              if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
+                this.enqueue(data.name, data.value, setter);
+              }
+            }
+          } catch (e) { console.warn("⚠️ Scratch メッセージ解析失敗:", e.message); }
+        });
+
+        ws.on("close", () => {
+          clearTimeout(connectTimeout);
+          console.warn("⚠️ Scratch 切断");
+          this.scratch.conn = null;
+          this.scratch.isReconnecting = false;
+          this.scheduleReconnect("scratch");
+        });
+
+        ws.on("error", e => {
+          clearTimeout(connectTimeout);
+          console.error("❌ Scratch エラー:", e.message);
+          this.scratch.conn = null;
+          this.scratch.isReconnecting = false;
+          this.scheduleReconnect("scratch");
+        });
+      })
+      .catch(e => {
+        console.error("❌ Scratch 接続失敗:", e.message);
+        this.scratch.conn = null;
+        this.scratch.isReconnecting = false;
+        this.scheduleReconnect("scratch");
+      });
+  }
+
+  connectTurboWarp() {
+    if (this.turbowarp.conn?.readyState === WebSocket.OPEN || this.turbowarp.isReconnecting) return;
+    this.turbowarp.isReconnecting = true;
+    try {
+      const ws = new WebSocket("wss://clouddata.turbowarp.org", { headers: { "User-Agent": "MarioMakerServer/1.0" } });
+      const setter = (name, value) => {
+        if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("TW切断"));
+        ws.send(JSON.stringify({ method: "set", name, value: String(value), user: "server-bot", project_id: PROJECT_ID }));
+        return Promise.resolve();
+      };
+      ws.on("open", async () => {
+        ws.send(JSON.stringify({ method: "handshake", user: "server-bot", project_id: PROJECT_ID }));
+        this.turbowarp.conn  = ws;
+        this.turbowarp.delay = 2000;
+        this.turbowarp.isReconnecting = false;
+        console.log("✅ TurboWarp Cloud 接続成功");
+        console.log("🔄 TurboWarp クラウド変数を初期化中...");
+        for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
+        console.log("✅ TurboWarp クラウド変数初期化完了");
+      });
+      ws.on("message", raw => {
+        try {
+          const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
+          for (const line of text.trim().split("\n")) {
+            if (!line) continue;
+            const data = JSON.parse(line);
+            if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
+              this.enqueue(data.name, data.value, setter);
+            }
+          }
+        } catch (e) { console.warn("⚠️ TW メッセージ解析失敗:", e.message); }
+      });
+      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
+      ws.on("error", e => { console.error("❌ TurboWarp エラー:", e.message); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
+    } catch (e) {
+      console.error("❌ TurboWarp 接続作成失敗:", e.message);
+      this.turbowarp.isReconnecting = false;
+      this.scheduleReconnect("turbowarp");
+    }
+  }
+
+  scheduleReconnect(mode) {
+    const data = this[mode];
+    if (data.isReconnecting) return;
+    const delay = Math.min(data.delay, 3600000);
+    console.log(`⏰ ${mode} 再接続 ${delay}ms 後`);
+    data.delay = Math.min(data.delay * 3, 3600000);
+    setTimeout(() => { if (mode === "scratch") this.connectScratch(); else this.connectTurboWarp(); }, delay);
+  }
+
+  scheduleWeeklyReset() {
+    setInterval(async () => {
+      await db.deleteOldLikes().catch(e => console.error("いいねクリーンアップ失敗:", e));
+      console.log("🗑️ いいねクリーンアップ実行");
+    }, 60 * 60 * 1000);
+    console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
+  }
+
+  // オンライン対戦で選出できるコースの判定（未判定のコースだけを5分ごとに判定する）
+  scheduleCourseSelectableJudging() {
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const { judged, selectable } = await db.judgeUnjudgedCourses();
+        if (judged > 0) console.log(`🎯 選出可能コースを判定: ${judged}件（うち選出可能 ${selectable}件）`);
+        db.pruneBattleRoomCourses();
+      } catch (e) {
+        console.error("選出可能コースの判定失敗:", e);
+      } finally {
+        running = false;
+      }
+    };
+    // 起動直後に1回（すでにあるコースを判定）、その後は5分ごと
+    db.applySelectableThreshold().catch(e => console.error("選出基準の反映失敗:", e)).finally(run);
+    setInterval(run, 5 * 60 * 1000);
+    console.log("📅 選出可能コースの判定: 5分ごとに実行（未判定のコースのみ）");
+  }
+
+  scheduleLikeFraudDetection() {
+    setInterval(async () => {
+      try {
+        const results = await db.detectAndCleanSuspiciousLikes();
+        for (const r of results) {
+          console.log(`🚨 不正いいね検知: course=${r.courseId} author=${r.author} removed=${r.removedCount} action=${r.action}`);
+        }
+      } catch (e) {
+        console.error("不正いいね検知処理失敗:", e);
+      }
+
+      // 職人別の不正分いいね自動削除（管理ページの「この職人の不正分いいねを削除」と同じ処理）
+      try {
+        const purged = await db.autoPurgeSuspiciousLikes();
+        for (const r of purged) {
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴なし=${r.noHistoryCount}, 不正判定ユーザー名数=${r.suspiciousUsernameCount}(投稿履歴あり${r.postedUsernameCount}+関連${r.linkedUsernameCount}), 不正判定ユーザーのいいね=${r.suspiciousLikeCount}, 検知日数=${r.incidentDays})`);
+          if (r.escalated) {
+            console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesDeleted}件削除), 職人登録をpendingに(${r.escalation.accountsRevoked}件)`);
+          }
+        }
+      } catch (e) {
+        console.error("不正分いいね自動削除失敗:", e);
+      }
+
+      // 重複いいね（共通の職人名で投稿しているユーザー名が、同じコースにいいね）の自動削除
+      try {
+        const dups = await db.autoPurgeDuplicateLikes();
+        for (const r of dups) {
+          console.log(`🧹 重複いいね自動削除: author=${r.author} removed=${r.removedCount} (${r.courseCount}コース / ${r.userCount}ユーザー名)`);
+        }
+      } catch (e) {
+        console.error("重複いいね自動削除失敗:", e);
+      }
+    }, 10 * 60 * 1000);
+    console.log("📅 不正いいね検知・不正分いいね自動削除: 10分ごとに実行");
+  }
+
+  scheduleChatCleanup() {
+    // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
+    const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
+    const DAU_RETENTION_DAYS  = 30; // 営業日ごとの訪問ユーザー記録の保存期間
+    const DELETED_LIKES_RETENTION_DAYS = 30; // 自動削除したいいねのバックアップ（復元できる期間）
+    setInterval(async () => {
+      try {
+        await db.deleteOldChatMessages(CHAT_RETENTION_DAYS);
+        await db.cleanupOldDailyUsage();
+        await db.cleanupOldDailyActiveUsers(DAU_RETENTION_DAYS);
+        await db.cleanupOldDeletedLikes(DELETED_LIKES_RETENTION_DAYS);
+        await db.cleanupOldOnlinePeaks(DAU_RETENTION_DAYS);
+        await db.cleanupOldBattleMatches(30);
+      } catch (e) {
+        console.error("チャットデータクリーンアップ失敗:", e);
+      }
+    }, 24 * 60 * 60 * 1000);
+    console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
+  }
+
+  scheduleDMPurge() {
+    // 2026/10/20 1:00(JST)を過ぎたら、DM(chat_dm)を全削除する（全体チャットは残す）
+    // 1:00以降に起動した場合も、起動直後に実行される。成功したら以降は実行しない。
+    const DM_PURGE_AT = Date.parse("2026-10-20T01:00:00+09:00");
+    let done = false;
+    let running = false;
+    const timer = setInterval(async () => {
+      if (done || running || Date.now() < DM_PURGE_AT) return;
+      running = true;
+      try {
+        await db.deleteAllDMs();
+        done = true;
+        clearInterval(timer);
+      } catch (e) {
+        console.error("DM全削除失敗（次回再試行します）:", e);
+      } finally {
+        running = false;
+      }
+    }, 60 * 1000);
+    timer.unref();
+    console.log("📅 DM全削除: 2026/10/20 1:00(JST)以降に実行");
+  }
+
+  async start() {
+    let lastUncaughtMsg = null;
+    let uncaughtCount = 0;
+    let uncaughtLogTimer = null;
+    process.on("uncaughtException", e => {
+      if (e.message === lastUncaughtMsg) {
+        uncaughtCount++;
+        if (!uncaughtLogTimer) {
+          uncaughtLogTimer = setTimeout(() => {
+            console.error(`❌ uncaughtException（直近30秒で同内容が${uncaughtCount}回発生）: ${lastUncaughtMsg}`);
+            uncaughtCount = 0;
+            uncaughtLogTimer = null;
+          }, 30000);
+        }
+      } else {
+        lastUncaughtMsg = e.message;
+        uncaughtCount = 0;
+        console.error("❌ uncaughtException:", e.message);
+      }
+    });
+    process.on("unhandledRejection", e => {
+      console.error("❌ unhandledRejection:", e);
+    });
+    pwcrypt.loadKey(); // 鍵がない/不正ならここで例外 → 起動失敗（CMD=52/54が黙って失敗するのを防ぐ）
+    await db.initDB();
+    await db.loadOnlinePeaks().catch(e => console.error("最大同接数の読み込み失敗:", e.message));
+    await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
+    this.scheduleWeeklyReset();
+    this.scheduleLikeFraudDetection();
+    this.scheduleCourseSelectableJudging();
+    this.scheduleChatCleanup();
+    this.scheduleDMPurge();
+
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url, `http://localhost`);
+
+      if (url.pathname === "/manage") {
+        const html = fs.readFileSync(path.join(__dirname, "manage.html"), "utf8");
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+
+      // 公開チャットAPI（Basic認証は不要。トークンで各エンドポイント内で認証する）
+      // chat.htmlはGitHub Pages等の別ドメインから呼ばれるためCORSを許可する
+      if (url.pathname.startsWith("/api/chat/")) {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+        await handleChatAPI(req, res);
+        return;
+      }
+
+      if (url.pathname.startsWith("/api/")) {
+        await handleManageAPI(req, res);
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      const businessDay = db.getBusinessDayForDisplay();
+      const dailyActiveUsers = await db.countDailyActiveUsers(businessDay).catch(() => null);
+      res.end(JSON.stringify({
+        status:    "ok",
+        scratch:   this.scratch.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+        turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+        queue:     this.queue.length,
+        onlineUsers: this.getOnlineUsers(),
+        onlineUsernames: this.getOnlineUsernames(),
+        businessDay: businessDay,          // 対象の営業日（6:00〜翌1:00）
+        dailyActiveUsers: dailyActiveUsers, // その営業日に訪れたユニークユーザー数
+        uptime:    process.uptime(),
+      }));
+    });
+    server.listen(PORT, () => console.log(`🌐 ヘルスチェック: http://0.0.0.0:${PORT}`));
+    setInterval(() => {
+      const s = this.scratch.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
+      const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
+      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
+    }, 5 * 60 * 1000);
+    const shutdown = () => {
+      console.log("🛑 シャットダウン...");
+      try { this.scratch.conn?.close();   } catch (_) {}
+      try { this.turbowarp.conn?.close(); } catch (_) {}
+      server.close();
+      db.pool.end();
+      process.exit(0);
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT",  shutdown);
+    console.log("🚀 サーバー起動完了");
+  }
+}
+
+if (require.main === module) {
+  new CloudManager().start().catch(e => { console.error("❌ 起動失敗:", e); process.exit(1); });
+}
+
+module.exports = { CloudManager };
