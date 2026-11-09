@@ -422,6 +422,20 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
+  // CMD=82: 週間バトルランキング / CMD=83: 全期間バトルランキング
+  // リクエスト: 基礎データ + 最大件数(Len)
+  // 返信: CMD=16と同じく、1行ごとに 順位(Len) + 職人名(alphabet) + 勝利数(Len) + レート(Len) を並べて送り、最後にCMD=1000を送る
+  if (cmd === CMD.BATTLE_RANK_WEEK || cmd === CMD.BATTLE_RANK_ALL) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = cmd === CMD.BATTLE_RANK_WEEK
+      ? await db.getBattleRankingWeek(limit)
+      : await db.getBattleRankingAll(limit);
+    await sendBattleRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
+    return;
+  }
+
   if (cmd === CMD.OFFICIAL_MAKER) {
     const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
