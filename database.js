@@ -2761,6 +2761,16 @@ async function getBattleRoomCourse(roomId) {
   return courseId;
 }
 
+/**
+ * ルームのコースIDを返す（CMD=85用）。getBattleRoomCourseと違い、なければ新しく選出せず null を返す。
+ * 取得に失敗した人に、他の参加者と違うコースを渡してしまわないため。
+ */
+async function peekBattleRoomCourse(roomId) {
+  const entry = battleRoomCourses.get(String(roomId));
+  if (!entry || Date.now() >= entry.expires) return null;
+  return (await courseExists(entry.courseId)) ? entry.courseId : null;
+}
+
 /** 期限切れのルームを忘れる */
 function pruneBattleRoomCourses() {
   const now = Date.now();
@@ -2808,5 +2818,5 @@ module.exports = {
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
-  pickRandomSelectableCourse, getBattleRoomCourse, pruneBattleRoomCourses,
+  pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,
 };

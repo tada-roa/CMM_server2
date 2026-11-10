@@ -33,6 +33,18 @@ const CLOUD_VARS   = [
   "☁ cloud5","☁ cloud6","☁ cloud7","☁ cloud8",
 ];
 
+// クラウド変数の使い分け:
+//   cloud1〜4 … サーバーが通常の返信に使う
+//   cloud5〜8 … オンライン対戦用。クライアント同士が情報を送り合うので、サーバーは原則書き込まない
+//               （サーバーが書くと対戦中の通信を上書きして壊すおそれがある）
+// どうしても5〜8を使う返信が必要になった場合のみ、randomCloud(CLOUD_VARS_ALL) のように明示的に指定する。
+const CLOUD_VARS_SERVER = CLOUD_VARS.slice(0, 4);
+const CLOUD_VARS_BATTLE = CLOUD_VARS.slice(4, 8);
+const CLOUD_VARS_ALL    = CLOUD_VARS;
+
+// 1つのクラウド変数に書き込む最大文字数（TurboWarp。以前は1000）
+const CLOUD_MAX_LEN = 5000;
+
 const CMD = {
   UPLOAD:          1,
   DELETE_COURSE:   2,
@@ -57,7 +69,8 @@ const CMD = {
   START_COURSE_LOADING:    81,   // オンライン対戦: ルームホストの要求で、ルームのコースデータをルーム全員へ一斉送信する
   BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
   BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
-  GET_ONLINECOURSE_INFO:   84,   // 返信専用: CMD=81のコースデータ送信が終わった後に、コースの基本情報（タイトル・職人名）をルーム全員へ自動送信する
+  GET_ONLINECOURSE_INFO:   84,   // 返信専用: CMD=81/85のコースデータ送信が終わった後に、コースの基本情報（タイトル・職人名）を自動送信する
+  GET_COURSEDATA_INDIVIDUAL: 85, // get_coursedata_individual: CMD=81でコース取得に失敗したユーザーが、ルームのコースを個別に再取得する
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -79,7 +92,7 @@ const KNOWN_CMDS = Object.fromEntries(
 
 const SEND_INTERVAL = 120;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
+function randomCloud(pool = CLOUD_VARS_SERVER) { return pool[Math.floor(Math.random() * pool.length)]; }
 
 // ── パスワード暗号化用ノンス（CMD=55で発行 → CMD=52/54で1回だけ使える）──
 // ユーザー名ごとに1つ。再発行すると前のノンスは無効になる。
@@ -150,7 +163,7 @@ async function sendEndMarker(setter, userId) {
 
 async function sendEncodedItems(setter, userId, cmd, items) {
   const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
-  const maxLen = 1000;
+  const maxLen = CLOUD_MAX_LEN;
   let buffer = "";
   for (const item of items) {
     if (buffer.length > 0 && (header + buffer + item).length > maxLen) {
@@ -236,7 +249,7 @@ function encodeMakerInfo(row) {
 
 async function sendCourseData(setter, userId, stageData) {
   const headerBase = encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_COURSE);
-  const maxLen = 1000;
+  const maxLen = CLOUD_MAX_LEN;
   const overhead = headerBase.length + 2 + 2;
   const chunkSize = maxLen - overhead;
   const totalChunks = Math.ceil(stageData.length / chunkSize);
@@ -247,6 +260,16 @@ async function sendCourseData(setter, userId, stageData) {
     await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(seq) + chunk);
   }
   await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(0));
+}
+
+// オンライン対戦のコース送信（CMD=81/85共通）:
+//   1) CMD=30と同じ形式のコースデータ → 2) 送り終えたらCMD=84(タイトル + 職人名)
+//   targetId は返信の userId の部分（CMD=81ではルームID、CMD=85では要求したユーザーのuserId）。
+//   コースデータはcloud1〜4のみで送る（cloud5〜8はクライアント同士の対戦通信用）。
+async function sendBattleCourse(setter, targetId, row) {
+  await sendCourseData(setter, targetId, row.stage_data);
+  await sendCloud(setter, randomCloud(CLOUD_VARS_SERVER),
+    encodeLenLen(targetId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(row.title) + encodeAlphabet(row.author));
 }
 
 function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
@@ -405,6 +428,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
   //   2) 1)を全部送り終えた後に、CMD=84(GET_ONLINECOURSE_INFO)としてコースの基本情報を自動送信
   //      = roomId(LenLen) + cmd(Len) + コースのタイトル(text) + コースを作った職人名(alphabet)
   //      （CMD=84はクライアントから受け取らない。返信専用）
+  // ※返信はcloud1〜4のみを使う（cloud5〜8はオンライン対戦のクライアント間通信用）。
   // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく。
   // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 だけを送る。
   if (cmd === CMD.START_COURSE_LOADING) {
@@ -416,9 +440,27 @@ async function handleRequest(s, setter, getOnlineUsers) {
       await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
       return;
     }
-    await sendCourseData(setter, roomId, row.stage_data);
-    await sendCloud(setter, randomCloud(),
-      encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(row.title) + encodeAlphabet(row.author));
+    await sendBattleCourse(setter, roomId, row);
+    return;
+  }
+
+  // CMD=85 get_coursedata_individual: CMD=81でコースの取得に失敗したユーザーが、ルームのコースを再取得する
+  // リクエスト: CMD=81と同じ。基礎データ(userId + cmd + username) + ルームID(Len)
+  // 返信（userId はそのまま要求したユーザーのもの。ルーム全員ではなく、そのユーザーだけに届く）:
+  //   1) CMD=30と同じ形式のコースデータ
+  //   2) 送り終えたらCMD=84（タイトル(text) + 職人名(alphabet)）
+  // コースは「CMD=81でそのルームに選出済みのコース」を返す（再選出はしない。他の参加者と同じコースにするため）。
+  // ルームのコースが未選出／期限切れ／コースが見つからない場合は、userIdあてに CMD=300 を返す。
+  if (cmd === CMD.GET_COURSEDATA_INDIVIDUAL) {
+    const { value: roomId } = decodeLen(s, pos);
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    const courseId = await db.peekBattleRoomCourse(roomId);
+    const row = courseId ? await db.getCourseById(courseId) : null;
+    if (!row) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    await sendBattleCourse(setter, parseInt(userId), row);
     return;
   }
 
