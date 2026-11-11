@@ -2729,7 +2729,6 @@ async function getActiveBattleRoom(roomId) {
 /**
  * ルームのレートを精算する。1つのルームにつき1回だけ成功する（2回目以降は status:"ignored"）。
  *   results … [{ author, time }]（CMD=86の内容）。null ならタイムアウト（10分過ぎても結果が来なかった）として全員負け。
- *   reporter … 結果を送ってきたユーザー名。参加者でなければ無視する。
  * time の意味: 0=切断して退出 / 負の値(-1)=制限時間内にクリアできず / 正の値=クリアまでのtick数（小さいほど速い）
  * ルール:
  *   ・正のtimeがいない、または勝者しかいない → 引き分け（レートも試合数も変えない）
@@ -2738,10 +2737,10 @@ async function getActiveBattleRoom(roomId) {
  *   ・敗者の下がり幅 = 各勝者との1対1の下がり幅の平均。切断(time=0)なら2倍
  *   ・結果が10分過ぎて届いた場合も、タイムアウトとして全員負け（下がり幅は BATTLE_TIMEOUT_LOSS）
  * 戻り値: { status: "settled", outcome: "normal"|"draw"|"timeout", players: [{author, rating, delta}] }
- *         | { status: "ignored" }（未登録・精算済み・期限前のタイムアウト指定・参加者以外が送信）
+ *         | { status: "ignored" }（未登録・精算済み・期限前のタイムアウト指定）
  *         | { status: "invalid" }（職人名が参加者と一致しない。精算せず、次の正しい結果を待つ）
  */
-async function finishBattleRoom(roomId, results, reporter = null) {
+async function finishBattleRoom(roomId, results) {
   const key = String(roomId);
   const client = await pool.connect();
   try {
@@ -2761,10 +2760,6 @@ async function finishBattleRoom(roomId, results, reporter = null) {
       if (!expired) { await client.query("ROLLBACK"); return { status: "ignored", reason: "not_expired" }; }
       timeoutMode = true;
     } else {
-      if (reporter !== null && !participants.includes(reporter)) {
-        await client.query("ROLLBACK");
-        return { status: "ignored", reason: "reporter_not_participant", participants };
-      }
       const names = results.map(r => r.author);
       const sameSet = names.length === participants.length
         && new Set(names).size === names.length

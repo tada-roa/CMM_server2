@@ -469,7 +469,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   // CMD=86: オンライン対戦の結果報告（ルーム全員が送る。最初の1件だけ処理し、以降は無視）
   // リクエスト: 基礎データ + ルームID(Len) + (職人名(alphabet) + クリアタイム(Len)) × 参加人数
-  //   参加人数と参加者はCMD=81で保存済みのものを使う。
+  //   参加人数と参加者はCMD=81で保存済みのものを使う。送信者(username)は確認しない（誰が送っても、最初の1件を処理する）。
   //   クリアタイム: クリアまでのtick数（最小が勝ち、同値は同時ゴールで全員勝ち）/ 0=切断して退出 / -1=クリアできず
   // 返信: userId の部分をルームIDにして、CMD=86 + (職人名(alphabet) + 新しいレート(Len)) × 参加人数
   //   （引き分け・タイムアウトでもレートを送る。レートの計算は database.js の finishBattleRoom を参照）
@@ -498,7 +498,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
     console.log(`   [battle] ルーム ${roomId}: 受信した結果=[${results.map(r => `${r.author}:${r.time}`).join(", ")}]`
       + (pos < s.length ? ` ⚠️ 読み取り後に未使用データが${s.length - pos}文字あります` : ""));
-    const out = await db.finishBattleRoom(roomId, results, username);
+    const out = await db.finishBattleRoom(roomId, results);
     if (out.status === "invalid") {
       console.warn(`⚠️ [battle] CMD=86 無視: ルーム ${roomId} の職人名が参加者と一致しません（送信者=${username}）`
         + ` 登録=[${out.expected.join(", ")}] 受信=[${out.received.join(", ")}]`);
@@ -508,7 +508,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
       const why = {
         room_not_found: "ルームが未登録です",
         already_settled: "すでに精算済みです（先に届いた結果で処理されました）",
-        reporter_not_participant: `送信者 ${username} は参加者ではありません（参加者=[${(out.participants || []).join(", ")}]）`,
         not_expired: "対象外です",
       }[out.reason] || out.reason;
       console.log(`   [battle] CMD=86 無視: ルーム ${roomId} ${why}`);
