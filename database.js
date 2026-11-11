@@ -226,6 +226,15 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_battle_matches_played ON battle_matches(played_at DESC);
     CREATE INDEX IF NOT EXISTS idx_battle_rating ON battle_stats(rating DESC);
 
+    -- オンライン対戦のルーム（CMD=81で参加者を保存 → CMD=86の結果でレート更新。10分以内に結果が来なければ全員負け）
+    CREATE TABLE IF NOT EXISTS battle_rooms (
+      room_id      TEXT    PRIMARY KEY,
+      participants TEXT    NOT NULL,                 -- 参加者の職人名のJSON配列
+      started_at   BIGINT  NOT NULL,                 -- CMD=81を受け取った時刻(秒)
+      settled      BOOLEAN NOT NULL DEFAULT FALSE    -- レート更新済みか
+    );
+    CREATE INDEX IF NOT EXISTS idx_battle_rooms_open ON battle_rooms(started_at) WHERE NOT settled;
+
     -- 最大同接数（scope='all' が全期間、営業日の文字列 'YYYY-MM-DD' がその営業日の最大）
     CREATE TABLE IF NOT EXISTS online_peaks (
       scope   TEXT    PRIMARY KEY,
@@ -2502,13 +2511,20 @@ function battleWinK(rating) {
   return BATTLE_K_WIN_MIN + (BATTLE_K_WIN_MAX - BATTLE_K_WIN_MIN) * remain * remain;
 }
 
-/** 試合結果から、勝者・敗者の新しいレートを計算する（DBには触らない） */
-function calcBattleRatings(winnerRating, loserRating) {
+const clampBattleRating = r => Math.min(BATTLE_MAX_RATING, Math.max(BATTLE_MIN_RATING, r));
+
+/** 1対1での、勝者の上がり幅(gain)と敗者の下がり幅(loss)（どちらも1以上の整数。DBには触らない） */
+function calcBattleDelta(winnerRating, loserRating) {
   const expectedWin = 1 / (1 + Math.pow(10, (loserRating - winnerRating) / BATTLE_ELO_SCALE));
   const gain = Math.max(1, Math.round(battleWinK(winnerRating) * (1 - expectedWin)));
   const loss = Math.max(1, Math.round(BATTLE_K_LOSS * (1 - expectedWin)));
-  const clamp = r => Math.min(BATTLE_MAX_RATING, Math.max(BATTLE_MIN_RATING, r));
-  return { winner: clamp(winnerRating + gain), loser: clamp(loserRating - loss) };
+  return { gain, loss };
+}
+
+/** 試合結果から、勝者・敗者の新しいレートを計算する（DBには触らない） */
+function calcBattleRatings(winnerRating, loserRating) {
+  const { gain, loss } = calcBattleDelta(winnerRating, loserRating);
+  return { winner: clampBattleRating(winnerRating + gain), loser: clampBattleRating(loserRating - loss) };
 }
 
 // 順位の並び: レートが高い → 勝利数が多い → 職人名（同じ成績でも順位が毎回同じになるように）
@@ -2656,6 +2672,191 @@ async function recordBattleResult(winnerAuthor, loserAuthor) {
     client.release();
   }
 }
+
+// ─────────────────────────────────────────────
+// オンライン対戦のルーム管理とレート精算（CMD=81 / CMD=86）
+// ─────────────────────────────────────────────
+const BATTLE_RESULT_TIMEOUT_SECONDS = 10 * 60;               // CMD=81から、この時間以内にCMD=86が来なければ全員負け
+const BATTLE_TIMEOUT_LOSS     = Math.round(BATTLE_K_LOSS * 0.5); // 全員負け(タイムアウト)のときの下がり幅（同レートの相手に負けた場合と同じ）
+const BATTLE_DISCONNECT_MULT  = 2;                           // 切断(クリアタイム0)の下がり幅の倍率
+const BATTLE_TIE_GAIN_MULT    = 0.5;                         // 同時ゴールの勝者の上がり幅の倍率
+const BATTLE_MAX_PLAYERS      = 8;                           // 1ルームの最大人数（不正な人数の弾き用）
+
+/**
+ * CMD=81: ルームの参加者を保存して、10分のカウントを始める。
+ * すでに「精算前」のルームがあれば上書きしない（再送で参加者の差し替えや時間の延長をされないように）。
+ * 精算済みのルームIDは、新しい対戦として登録し直す。
+ * 戻り値: 登録したら true、上書きしなかったら false
+ */
+async function startBattleRoom(roomId, participants) {
+  const key = String(roomId);
+  await finishBattleRoom(key, null); // 期限切れで未精算なら、先に全員負けで精算する（期限内なら何もしない）
+  const now = Math.floor(Date.now() / 1000);
+  const { rowCount } = await pool.query(
+    `INSERT INTO battle_rooms (room_id, participants, started_at, settled)
+     VALUES ($1, $2, $3, FALSE)
+     ON CONFLICT (room_id) DO UPDATE
+       SET participants = EXCLUDED.participants, started_at = EXCLUDED.started_at, settled = FALSE
+       WHERE battle_rooms.settled`,
+    [key, JSON.stringify(participants), now]
+  );
+  return rowCount > 0;
+}
+
+/** 精算前のルームの参加者（職人名の配列）を返す。なければ（未登録・精算済み）null */
+async function getActiveBattleRoom(roomId) {
+  const { rows } = await pool.query(
+    "SELECT participants FROM battle_rooms WHERE room_id = $1 AND NOT settled", [String(roomId)]
+  );
+  return rows.length ? JSON.parse(rows[0].participants) : null;
+}
+
+/**
+ * ルームのレートを精算する。1つのルームにつき1回だけ成功する（2回目以降は status:"ignored"）。
+ *   results … [{ author, time }]（CMD=86の内容）。null ならタイムアウト（10分過ぎても結果が来なかった）として全員負け。
+ *   reporter … 結果を送ってきたユーザー名。参加者でなければ無視する。
+ * time の意味: 0=切断して退出 / 負の値(-1)=制限時間内にクリアできず / 正の値=クリアまでのtick数（小さいほど速い）
+ * ルール:
+ *   ・正のtimeがいない、または勝者しかいない → 引き分け（レートも試合数も変えない）
+ *   ・勝者 = 正のtimeの最小値の職人（同値は全員勝ち）。それ以外は負け
+ *   ・勝者の上がり幅 = 各敗者との1対1の上がり幅(calcBattleDelta)の平均。同時ゴールなら1/2
+ *   ・敗者の下がり幅 = 各勝者との1対1の下がり幅の平均。切断(time=0)なら2倍
+ *   ・結果が10分過ぎて届いた場合も、タイムアウトとして全員負け（下がり幅は BATTLE_TIMEOUT_LOSS）
+ * 戻り値: { status: "settled", outcome: "normal"|"draw"|"timeout", players: [{author, rating, delta}] }
+ *         | { status: "ignored" }（未登録・精算済み・期限前のタイムアウト指定・参加者以外が送信）
+ *         | { status: "invalid" }（職人名が参加者と一致しない。精算せず、次の正しい結果を待つ）
+ */
+async function finishBattleRoom(roomId, results, reporter = null) {
+  const key = String(roomId);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: roomRows } = await client.query(
+      "SELECT participants, started_at, settled FROM battle_rooms WHERE room_id = $1 FOR UPDATE", [key]
+    );
+    if (!roomRows.length || roomRows[0].settled) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+    const participants = JSON.parse(roomRows[0].participants);
+    const now = Math.floor(Date.now() / 1000);
+    const expired = now - Number(roomRows[0].started_at) >= BATTLE_RESULT_TIMEOUT_SECONDS;
+
+    let timeoutMode = false;
+    let timeOf = new Map();
+    if (results === null) {
+      if (!expired) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+      timeoutMode = true;
+    } else {
+      if (reporter !== null && !participants.includes(reporter)) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+      const names = results.map(r => r.author);
+      const sameSet = names.length === participants.length
+        && new Set(names).size === names.length
+        && participants.every(a => names.includes(a));
+      if (!sameSet) { await client.query("ROLLBACK"); return { status: "invalid" }; }
+      for (const r of results) timeOf.set(r.author, r.time);
+      if (expired) timeoutMode = true; // 10分以上経ってから届いた結果は、結果なし扱い
+    }
+
+    // 参加者の行を用意して、職人名の順でロックして現在のレートを読む
+    for (const a of participants) {
+      await client.query("INSERT INTO battle_stats (author, rating) VALUES ($1, $2) ON CONFLICT (author) DO NOTHING", [a, BATTLE_INITIAL_RATING]);
+    }
+    const { rows: stat } = await client.query(
+      "SELECT author, rating FROM battle_stats WHERE author = ANY($1::text[]) ORDER BY author FOR UPDATE", [participants]
+    );
+    const before = new Map(stat.map(r => [r.author, r.rating]));
+
+    // 勝者・敗者を決める
+    let winners = [], losers = [], outcome;
+    if (timeoutMode) {
+      outcome = "timeout";
+      losers = [...participants];
+    } else {
+      const cleared = participants.filter(a => timeOf.get(a) > 0);
+      if (!cleared.length) {
+        outcome = "draw"; // 全員が -1 または 0
+      } else {
+        const best = Math.min(...cleared.map(a => timeOf.get(a)));
+        winners = cleared.filter(a => timeOf.get(a) === best);
+        losers  = participants.filter(a => !winners.includes(a));
+        outcome = losers.length ? "normal" : "draw"; // 全員同時ゴール（負けがいない）は引き分け
+      }
+    }
+
+    // レート変動
+    const after = new Map(before);
+    if (outcome === "timeout") {
+      for (const a of losers) after.set(a, clampBattleRating(before.get(a) - BATTLE_TIMEOUT_LOSS));
+    } else if (outcome === "normal") {
+      const avg = arr => arr.reduce((x, y) => x + y, 0) / arr.length;
+      const tie = winners.length > 1;
+      for (const w of winners) {
+        let gain = Math.round(avg(losers.map(l => calcBattleDelta(before.get(w), before.get(l)).gain)));
+        if (tie) gain = Math.max(1, Math.round(gain * BATTLE_TIE_GAIN_MULT));
+        after.set(w, clampBattleRating(before.get(w) + gain));
+      }
+      for (const l of losers) {
+        let loss = Math.round(avg(winners.map(w => calcBattleDelta(before.get(w), before.get(l)).loss)));
+        if (timeOf.get(l) === 0) loss *= BATTLE_DISCONNECT_MULT; // 切断のペナルティ
+        after.set(l, clampBattleRating(before.get(l) - loss));
+      }
+    }
+
+    // 保存（引き分けは成績を変えない）
+    if (outcome !== "draw") {
+      for (const a of participants) {
+        const isWinner = winners.includes(a);
+        await client.query(
+          "UPDATE battle_stats SET rating = $2, matches = matches + 1, wins = wins + $3, last_played_at = $4 WHERE author = $1",
+          [a, after.get(a), isWinner ? 1 : 0, now]
+        );
+      }
+      // 週間勝利数の集計用: 勝者1人につき1行（敗者の列は、敗者のうち職人名が最初の1人を入れる）
+      const sortedLosers = [...losers].sort();
+      for (const w of winners) {
+        await client.query(
+          "INSERT INTO battle_matches (winner, loser, winner_rating, loser_rating, played_at) VALUES ($1, $2, $3, $4, $5)",
+          [w, sortedLosers[0], after.get(w), after.get(sortedLosers[0]), now]
+        );
+      }
+    }
+    await client.query("UPDATE battle_rooms SET settled = TRUE WHERE room_id = $1", [key]);
+    await client.query("COMMIT");
+    return {
+      status: "settled",
+      outcome,
+      players: participants.map(a => ({ author: a, rating: after.get(a), delta: after.get(a) - before.get(a) })),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/** 10分以上結果が来ていないルームを、全員負けとして精算する。精算した件数を返す */
+async function settleExpiredBattleRooms() {
+  const cutoff = Math.floor(Date.now() / 1000) - BATTLE_RESULT_TIMEOUT_SECONDS;
+  const { rows } = await pool.query(
+    "SELECT room_id FROM battle_rooms WHERE NOT settled AND started_at <= $1", [cutoff]
+  );
+  let n = 0;
+  for (const r of rows) {
+    try {
+      const out = await finishBattleRoom(r.room_id, null);
+      if (out.status === "settled") n++;
+    } catch (e) {
+      console.error(`バトルルーム(${r.room_id})のタイムアウト精算に失敗:`, e.message);
+    }
+  }
+  return n;
+}
+
+/** 精算済みの古いルームを削除する */
+async function cleanupOldBattleRooms(retentionDays = 1) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  await pool.query("DELETE FROM battle_rooms WHERE settled AND started_at < $1", [cutoff]);
+}
+
 
 // ─────────────────────────────────────────────
 // オンライン対戦のコース選出（CMD=81）
@@ -2815,7 +3016,8 @@ module.exports = {
   listIncidentDeletedLikes, restoreDeletedLikes, cleanupOldDeletedLikes,
   loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
   countWeeklyActiveUsers, countRegisteredMakers,
-  getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings,
+  getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings, calcBattleDelta,
+  BATTLE_MAX_PLAYERS, startBattleRoom, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,

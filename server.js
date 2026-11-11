@@ -69,6 +69,7 @@ const CMD = {
   START_COURSE_LOADING:    81,   // オンライン対戦: ルームホストの要求で、ルームのコースデータをルーム全員へ一斉送信する
   BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
   BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
+  BATTLE_RESULT:           86,   // オンライン対戦の結果報告（ルーム全員が送る。最初の1件だけ処理）。返信も同じCMD=86（新しいレート）
   GET_ONLINECOURSE_INFO:   84,   // 返信専用: CMD=81/85のコースデータ送信が終わった後に、コースの基本情報（タイトル・職人名）を自動送信する
   GET_COURSEDATA_INDIVIDUAL: 85, // get_coursedata_individual: CMD=81でコース取得に失敗したユーザーが、ルームのコースを個別に再取得する
   LIKE:           20,
@@ -432,8 +433,27 @@ async function handleRequest(s, setter, getOnlineUsers) {
   // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく。
   // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 だけを送る。
   if (cmd === CMD.START_COURSE_LOADING) {
-    const { value: roomId } = decodeLen(s, pos);
+    const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+
+    // ルームIDの後に、参加人数(Len) + 参加者の職人名(alphabet)×人数 が続く。レート更新(CMD=86)のために保存しておく。
+    // 読み取れなくてもコースの送信は続ける（その場合、このルームの結果(CMD=86)は無視される）。
+    try {
+      const { value: count, next: r2 } = decodeLen(s, pos); pos = r2;
+      if (!isValidNum(count) || count < 1 || count > db.BATTLE_MAX_PLAYERS) throw new Error(`不正な参加人数: ${count}`);
+      const names = [];
+      for (let i = 0; i < count; i++) {
+        const { value: name, next } = decodeAlphabet(s, pos); pos = next;
+        if (!isValidStr(name)) throw new Error("不正な参加者名");
+        names.push(name);
+      }
+      if (new Set(names).size !== names.length) throw new Error("参加者名が重複しています");
+      const registered = await db.startBattleRoom(roomId, names);
+      if (!registered) console.log(`ℹ️ バトルルーム ${roomId}: 精算前のため参加者は上書きしません`);
+    } catch (e) {
+      console.warn(`⚠️ バトルルーム ${roomId} の参加者を保存できません:`, e.message);
+    }
+
     const courseId = await db.getBattleRoomCourse(roomId);
     const row = courseId ? await db.getCourseById(courseId) : null;
     if (!row) {
@@ -441,6 +461,40 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendBattleCourse(setter, roomId, row);
+    return;
+  }
+
+  // CMD=86: オンライン対戦の結果報告（ルーム全員が送る。最初の1件だけ処理し、以降は無視）
+  // リクエスト: 基礎データ + ルームID(Len) + (職人名(alphabet) + クリアタイム(Len)) × 参加人数
+  //   参加人数と参加者はCMD=81で保存済みのものを使う。
+  //   クリアタイム: クリアまでのtick数（最小が勝ち、同値は同時ゴールで全員勝ち）/ 0=切断して退出 / -1=クリアできず
+  // 返信: userId の部分をルームIDにして、CMD=86 + (職人名(alphabet) + 新しいレート(Len)) × 参加人数
+  //   （引き分け・タイムアウトでもレートを送る。レートの計算は database.js の finishBattleRoom を参照）
+  // CMD=81から10分以上経ってから届いた場合は、全員負け（タイムアウト）として精算される。
+  if (cmd === CMD.BATTLE_RESULT) {
+    const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    const participants = await db.getActiveBattleRoom(roomId);
+    if (!participants) return; // 未登録、または精算済み（2件目以降）は無視
+    const results = [];
+    try {
+      for (let i = 0; i < participants.length; i++) {
+        const { value: name, next: a } = decodeAlphabet(s, pos); pos = a;
+        const { value: time, next: b } = decodeLen(s, pos); pos = b;
+        if (!isValidStr(name) || !isValidNum(time)) throw new Error("不正な結果データ");
+        results.push({ author: name, time });
+      }
+    } catch (e) {
+      console.warn(`⚠️ バトルルーム ${roomId} の結果を読み取れません:`, e.message);
+      return;
+    }
+    const out = await db.finishBattleRoom(roomId, results, username);
+    if (out.status === "invalid") { console.warn(`⚠️ バトルルーム ${roomId}: 職人名が参加者と一致しません（${username}）`); return; }
+    if (out.status !== "settled") return;
+    console.log(`🏁 バトルルーム ${roomId} 精算(${out.outcome}): ` + out.players.map(p => `${p.author} ${p.rating}(${p.delta >= 0 ? "+" : ""}${p.delta})`).join(", "));
+    const payload = encodeLenLen(roomId) + encodeLen(CMD.BATTLE_RESULT)
+      + out.players.map(p => encodeAlphabet(p.author) + encodeLen(p.rating)).join("");
+    await sendCloud(setter, randomCloud(), payload);
     return;
   }
 
@@ -2090,11 +2144,32 @@ class CloudManager {
         await db.cleanupOldDeletedLikes(DELETED_LIKES_RETENTION_DAYS);
         await db.cleanupOldOnlinePeaks(DAU_RETENTION_DAYS);
         await db.cleanupOldBattleMatches(30);
+        await db.cleanupOldBattleRooms(1);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }
     }, 24 * 60 * 60 * 1000);
     console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
+  }
+
+  scheduleBattleRoomSettle() {
+    // CMD=81から10分以上CMD=86が来ないルームを、全員負けとして精算する（起動直後にも実行 → 再起動をまたいだルームも精算される）
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const n = await db.settleExpiredBattleRooms();
+        if (n > 0) console.log(`⏱ バトルルーム ${n}件を、結果なし(タイムアウト)で精算しました`);
+      } catch (e) {
+        console.error("バトルルームのタイムアウト精算失敗:", e.message);
+      } finally {
+        running = false;
+      }
+    };
+    run();
+    setInterval(run, 30 * 1000).unref();
+    console.log("📅 バトルルームのタイムアウト精算: 30秒ごとに確認（CMD=81から10分）");
   }
 
   scheduleDMPurge() {
@@ -2152,6 +2227,7 @@ class CloudManager {
     this.scheduleCourseSelectableJudging();
     this.scheduleChatCleanup();
     this.scheduleDMPurge();
+    this.scheduleBattleRoomSettle();
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);
