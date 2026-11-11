@@ -2703,6 +2703,21 @@ async function startBattleRoom(roomId, participants) {
   return rowCount > 0;
 }
 
+/** ルームの状態（ログ用）。未登録なら null。{ participants, startedAt, elapsedSec, settled } */
+async function getBattleRoomInfo(roomId) {
+  const { rows } = await pool.query(
+    "SELECT participants, started_at, settled FROM battle_rooms WHERE room_id = $1", [String(roomId)]
+  );
+  if (!rows.length) return null;
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    participants: JSON.parse(rows[0].participants),
+    startedAt: Number(rows[0].started_at),
+    elapsedSec: now - Number(rows[0].started_at),
+    settled: !!rows[0].settled,
+  };
+}
+
 /** 精算前のルームの参加者（職人名の配列）を返す。なければ（未登録・精算済み）null */
 async function getActiveBattleRoom(roomId) {
   const { rows } = await pool.query(
@@ -2734,7 +2749,8 @@ async function finishBattleRoom(roomId, results, reporter = null) {
     const { rows: roomRows } = await client.query(
       "SELECT participants, started_at, settled FROM battle_rooms WHERE room_id = $1 FOR UPDATE", [key]
     );
-    if (!roomRows.length || roomRows[0].settled) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+    if (!roomRows.length) { await client.query("ROLLBACK"); return { status: "ignored", reason: "room_not_found" }; }
+    if (roomRows[0].settled) { await client.query("ROLLBACK"); return { status: "ignored", reason: "already_settled" }; }
     const participants = JSON.parse(roomRows[0].participants);
     const now = Math.floor(Date.now() / 1000);
     const expired = now - Number(roomRows[0].started_at) >= BATTLE_RESULT_TIMEOUT_SECONDS;
@@ -2742,15 +2758,18 @@ async function finishBattleRoom(roomId, results, reporter = null) {
     let timeoutMode = false;
     let timeOf = new Map();
     if (results === null) {
-      if (!expired) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+      if (!expired) { await client.query("ROLLBACK"); return { status: "ignored", reason: "not_expired" }; }
       timeoutMode = true;
     } else {
-      if (reporter !== null && !participants.includes(reporter)) { await client.query("ROLLBACK"); return { status: "ignored" }; }
+      if (reporter !== null && !participants.includes(reporter)) {
+        await client.query("ROLLBACK");
+        return { status: "ignored", reason: "reporter_not_participant", participants };
+      }
       const names = results.map(r => r.author);
       const sameSet = names.length === participants.length
         && new Set(names).size === names.length
         && participants.every(a => names.includes(a));
-      if (!sameSet) { await client.query("ROLLBACK"); return { status: "invalid" }; }
+      if (!sameSet) { await client.query("ROLLBACK"); return { status: "invalid", expected: participants, received: names }; }
       for (const r of results) timeOf.set(r.author, r.time);
       if (expired) timeoutMode = true; // 10分以上経ってから届いた結果は、結果なし扱い
     }
@@ -2823,6 +2842,9 @@ async function finishBattleRoom(roomId, results, reporter = null) {
     return {
       status: "settled",
       outcome,
+      lateResult: results !== null && expired,   // 結果は届いたが、10分を過ぎていたため全員負けにした
+      elapsedSec: now - Number(roomRows[0].started_at),
+      winners, losers,
       players: participants.map(a => ({ author: a, rating: after.get(a), delta: after.get(a) - before.get(a) })),
     };
   } catch (e) {
@@ -2843,7 +2865,11 @@ async function settleExpiredBattleRooms() {
   for (const r of rows) {
     try {
       const out = await finishBattleRoom(r.room_id, null);
-      if (out.status === "settled") n++;
+      if (out.status === "settled") {
+        n++;
+        console.log(`⏱ [battle] ルーム ${r.room_id}: ${out.elapsedSec}秒経過しても結果(CMD=86)が来なかったため全員負けで精算 → `
+          + out.players.map(p => `${p.author} ${p.rating}(${p.delta})`).join(", "));
+      }
     } catch (e) {
       console.error(`バトルルーム(${r.room_id})のタイムアウト精算に失敗:`, e.message);
     }
@@ -3017,7 +3043,7 @@ module.exports = {
   loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
   countWeeklyActiveUsers, countRegisteredMakers,
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings, calcBattleDelta,
-  BATTLE_MAX_PLAYERS, startBattleRoom, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
+  BATTLE_MAX_PLAYERS, startBattleRoom, getBattleRoomInfo, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,

@@ -435,6 +435,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
   if (cmd === CMD.START_COURSE_LOADING) {
     const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    console.log(`📥 [battle] CMD=81 受信: 送信者=${username} ルーム=${roomId}`);
 
     // ルームIDの後に、参加人数(Len) + 参加者の職人名(alphabet)×人数 が続く。レート更新(CMD=86)のために保存しておく。
     // 読み取れなくてもコースの送信は続ける（その場合、このルームの結果(CMD=86)は無視される）。
@@ -448,10 +449,12 @@ async function handleRequest(s, setter, getOnlineUsers) {
         names.push(name);
       }
       if (new Set(names).size !== names.length) throw new Error("参加者名が重複しています");
+      console.log(`   [battle] ルーム ${roomId}: 参加人数=${count} 参加者=[${names.join(", ")}]` + (pos < s.length ? `（未使用の残りデータ ${s.length - pos}文字）` : ""));
       const registered = await db.startBattleRoom(roomId, names);
-      if (!registered) console.log(`ℹ️ バトルルーム ${roomId}: 精算前のため参加者は上書きしません`);
+      if (registered) console.log(`   [battle] ルーム ${roomId}: 参加者を保存しました（10分のカウント開始）`);
+      else console.log(`   [battle] ルーム ${roomId}: 精算前のルームが既にあるため、参加者・開始時刻は上書きしません（再送扱い）`);
     } catch (e) {
-      console.warn(`⚠️ バトルルーム ${roomId} の参加者を保存できません:`, e.message);
+      console.warn(`⚠️ [battle] ルーム ${roomId} の参加者を保存できません（残りデータ: "${s.slice(pos, pos + 60)}"）:`, e.message);
     }
 
     const courseId = await db.getBattleRoomCourse(roomId);
@@ -474,27 +477,55 @@ async function handleRequest(s, setter, getOnlineUsers) {
   if (cmd === CMD.BATTLE_RESULT) {
     const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
-    const participants = await db.getActiveBattleRoom(roomId);
-    if (!participants) return; // 未登録、または精算済み（2件目以降）は無視
+    console.log(`📥 [battle] CMD=86 受信: 送信者=${username} ルーム=${roomId} データ長=${s.length}`);
+    const info = await db.getBattleRoomInfo(roomId);
+    if (!info) { console.warn(`⚠️ [battle] CMD=86 無視: ルーム ${roomId} はCMD=81で登録されていません（81の参加者保存に失敗した、またはルームIDが違う）`); return; }
+    if (info.settled) { console.log(`   [battle] CMD=86 無視: ルーム ${roomId} は精算済みです（2件目以降の結果）`); return; }
+    const participants = info.participants;
+    console.log(`   [battle] ルーム ${roomId}: 登録済みの参加者=[${participants.join(", ")}]（${participants.length}人） CMD=81から${info.elapsedSec}秒`);
     const results = [];
     try {
       for (let i = 0; i < participants.length; i++) {
         const { value: name, next: a } = decodeAlphabet(s, pos); pos = a;
         const { value: time, next: b } = decodeLen(s, pos); pos = b;
-        if (!isValidStr(name) || !isValidNum(time)) throw new Error("不正な結果データ");
+        if (!isValidStr(name) || !isValidNum(time)) throw new Error(`${i + 1}人目のデータが不正（name=${JSON.stringify(name)}, time=${time}）`);
         results.push({ author: name, time });
       }
     } catch (e) {
-      console.warn(`⚠️ バトルルーム ${roomId} の結果を読み取れません:`, e.message);
+      console.warn(`⚠️ [battle] CMD=86 無視: ルーム ${roomId} の結果を読み取れません: ${e.message}`
+        + ` / ここまでに読めた結果=[${results.map(r => `${r.author}:${r.time}`).join(", ")}] / 登録人数=${participants.length}`);
       return;
     }
+    console.log(`   [battle] ルーム ${roomId}: 受信した結果=[${results.map(r => `${r.author}:${r.time}`).join(", ")}]`
+      + (pos < s.length ? ` ⚠️ 読み取り後に未使用データが${s.length - pos}文字あります` : ""));
     const out = await db.finishBattleRoom(roomId, results, username);
-    if (out.status === "invalid") { console.warn(`⚠️ バトルルーム ${roomId}: 職人名が参加者と一致しません（${username}）`); return; }
-    if (out.status !== "settled") return;
-    console.log(`🏁 バトルルーム ${roomId} 精算(${out.outcome}): ` + out.players.map(p => `${p.author} ${p.rating}(${p.delta >= 0 ? "+" : ""}${p.delta})`).join(", "));
+    if (out.status === "invalid") {
+      console.warn(`⚠️ [battle] CMD=86 無視: ルーム ${roomId} の職人名が参加者と一致しません（送信者=${username}）`
+        + ` 登録=[${out.expected.join(", ")}] 受信=[${out.received.join(", ")}]`);
+      return;
+    }
+    if (out.status === "ignored") {
+      const why = {
+        room_not_found: "ルームが未登録です",
+        already_settled: "すでに精算済みです（先に届いた結果で処理されました）",
+        reporter_not_participant: `送信者 ${username} は参加者ではありません（参加者=[${(out.participants || []).join(", ")}]）`,
+        not_expired: "対象外です",
+      }[out.reason] || out.reason;
+      console.log(`   [battle] CMD=86 無視: ルーム ${roomId} ${why}`);
+      return;
+    }
+    const outcomeLabel = { normal: "通常", draw: "引き分け（レート変動なし）", timeout: "全員負け（タイムアウト）" }[out.outcome] || out.outcome;
+    console.log(`🏁 [battle] ルーム ${roomId} 精算: ${outcomeLabel}${out.lateResult ? " ※10分を過ぎてから結果が届いたため" : ""}（${out.elapsedSec}秒経過）`);
+    if (out.winners.length) console.log(`   [battle] 勝者=[${out.winners.join(", ")}] 敗者=[${out.losers.join(", ")}]`);
+    for (const p of out.players) {
+      const t = results.find(r => r.author === p.author)?.time;
+      const kind = t > 0 ? `${t}tick` : t === 0 ? "切断(0)" : `未クリア(${t})`;
+      console.log(`   [battle]   ${p.author}: ${kind} → レート ${p.rating}（${p.delta >= 0 ? "+" : ""}${p.delta}）`);
+    }
     const payload = encodeLenLen(roomId) + encodeLen(CMD.BATTLE_RESULT)
       + out.players.map(p => encodeAlphabet(p.author) + encodeLen(p.rating)).join("");
     await sendCloud(setter, randomCloud(), payload);
+    console.log(`   [battle] ルーム ${roomId}: CMD=86 の返信を送信しました（${out.players.length}人分）`);
     return;
   }
 
@@ -508,12 +539,15 @@ async function handleRequest(s, setter, getOnlineUsers) {
   if (cmd === CMD.GET_COURSEDATA_INDIVIDUAL) {
     const { value: roomId } = decodeLen(s, pos);
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    console.log(`📥 [battle] CMD=85 受信: 送信者=${username} userId=${userId} ルーム=${roomId}`);
     const courseId = await db.peekBattleRoomCourse(roomId);
     const row = courseId ? await db.getCourseById(courseId) : null;
     if (!row) {
+      console.warn(`⚠️ [battle] CMD=85: ルーム ${roomId} のコースが見つかりません（${courseId ? "コースが削除済み" : "未選出または期限切れ"}）→ CMD=300を返信`);
       await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
       return;
     }
+    console.log(`   [battle] CMD=85: ルーム ${roomId} のコース ${courseId}「${row.title}」を userId=${userId} に送信`);
     await sendBattleCourse(setter, parseInt(userId), row);
     return;
   }
