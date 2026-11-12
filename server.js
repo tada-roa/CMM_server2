@@ -84,6 +84,7 @@ const CMD = {
   END_MARKER:   1000,
   DISABLED:     1001,   // 使用不可CMDを受信したときの返信
   NOT_ENCRYPTED: 409,   // 暗号化されていないと思われるパスワードを受信したときの返信
+  BANNED:        400,   // 返信専用: BANされているユーザー名からのCMD=81/86を拒否したときの返信
 };
 
 // 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
@@ -433,6 +434,11 @@ async function handleRequest(s, setter, getOnlineUsers) {
   // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく。
   // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 だけを送る。
   if (cmd === CMD.START_COURSE_LOADING) {
+    if (await db.isUserBanned(username)) {
+      console.warn(`⚠️ [battle] CMD=81 拒否: ${username} はBANされています → CMD=400を返信`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.BANNED));
+      return;
+    }
     const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
     console.log(`📥 [battle] CMD=81 受信: 送信者=${username} ルーム=${roomId}`);
@@ -475,6 +481,11 @@ async function handleRequest(s, setter, getOnlineUsers) {
   //   （引き分け・タイムアウトでもレートを送る。レートの計算は database.js の finishBattleRoom を参照）
   // CMD=81から10分以上経ってから届いた場合は、全員負け（タイムアウト）として精算される。
   if (cmd === CMD.BATTLE_RESULT) {
+    if (await db.isUserBanned(username)) {
+      console.warn(`⚠️ [battle] CMD=86 拒否: ${username} はBANされています → CMD=400を返信`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.BANNED));
+      return;
+    }
     const { value: roomId, next: r1 } = decodeLen(s, pos); pos = r1;
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
     console.log(`📥 [battle] CMD=86 受信: 送信者=${username} ルーム=${roomId} データ長=${s.length}`);
