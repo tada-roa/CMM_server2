@@ -2676,8 +2676,7 @@ async function recordBattleResult(winnerAuthor, loserAuthor) {
 // ─────────────────────────────────────────────
 // オンライン対戦のルーム管理とレート精算（CMD=81 / CMD=86）
 // ─────────────────────────────────────────────
-const BATTLE_RESULT_TIMEOUT_SECONDS = 10 * 60;               // CMD=81から、この時間以内にCMD=86が来なければ全員負け
-const BATTLE_TIMEOUT_LOSS     = Math.round(BATTLE_K_LOSS * 0.5); // 全員負け(タイムアウト)のときの下がり幅（同レートの相手に負けた場合と同じ）
+const BATTLE_RESULT_TIMEOUT_SECONDS = 10 * 60;               // CMD=81から、この時間以内にCMD=86が来なければ結果なし扱い（レート変動なし）
 const BATTLE_DISCONNECT_MULT  = 2;                           // 切断(クリアタイム0)の下がり幅の倍率
 const BATTLE_TIE_GAIN_MULT    = 0.5;                         // 同時ゴールの勝者の上がり幅の倍率
 const BATTLE_MAX_PLAYERS      = 8;                           // 1ルームの最大人数（不正な人数の弾き用）
@@ -2735,7 +2734,8 @@ async function getActiveBattleRoom(roomId) {
  *   ・勝者 = 正のtimeの最小値の職人（同値は全員勝ち）。それ以外は負け
  *   ・勝者の上がり幅 = 各敗者との1対1の上がり幅(calcBattleDelta)の平均。同時ゴールなら1/2
  *   ・敗者の下がり幅 = 各勝者との1対1の下がり幅の平均。切断(time=0)なら2倍
- *   ・結果が10分過ぎて届いた場合も、タイムアウトとして全員負け（下がり幅は BATTLE_TIMEOUT_LOSS）
+ *   ・10分経ってもCMD=86が来なかった場合（タイムアウト）、または結果が10分を過ぎて届いた場合は、
+ *     結果なし扱いとしてレート・試合数とも変動なし（引き分けと同じ扱い）
  * 戻り値: { status: "settled", outcome: "normal"|"draw"|"timeout", players: [{author, rating, delta}] }
  *         | { status: "ignored" }（未登録・精算済み・期限前のタイムアウト指定）
  *         | { status: "invalid" }（職人名が参加者と一致しない。精算せず、次の正しい結果を待つ）
@@ -2754,7 +2754,7 @@ async function finishBattleRoom(roomId, results) {
     const now = Math.floor(Date.now() / 1000);
     const expired = now - Number(roomRows[0].started_at) >= BATTLE_RESULT_TIMEOUT_SECONDS;
 
-    let timeoutMode = false;
+    let timeoutMode = false; // 結果なし（タイムアウト or 期限を過ぎて届いた結果）。レート・試合数とも変動なし
     let timeOf = new Map();
     if (results === null) {
       if (!expired) { await client.query("ROLLBACK"); return { status: "ignored", reason: "not_expired" }; }
@@ -2781,8 +2781,7 @@ async function finishBattleRoom(roomId, results) {
     // 勝者・敗者を決める
     let winners = [], losers = [], outcome;
     if (timeoutMode) {
-      outcome = "timeout";
-      losers = [...participants];
+      outcome = "timeout"; // レート・試合数とも変動なし（下のoutcome !== "draw"の判定にも含める）
     } else {
       const cleared = participants.filter(a => timeOf.get(a) > 0);
       if (!cleared.length) {
@@ -2795,11 +2794,9 @@ async function finishBattleRoom(roomId, results) {
       }
     }
 
-    // レート変動
+    // レート変動（timeoutはdrawと同じく変動なし）
     const after = new Map(before);
-    if (outcome === "timeout") {
-      for (const a of losers) after.set(a, clampBattleRating(before.get(a) - BATTLE_TIMEOUT_LOSS));
-    } else if (outcome === "normal") {
+    if (outcome === "normal") {
       const avg = arr => arr.reduce((x, y) => x + y, 0) / arr.length;
       const tie = winners.length > 1;
       for (const w of winners) {
@@ -2814,8 +2811,8 @@ async function finishBattleRoom(roomId, results) {
       }
     }
 
-    // 保存（引き分けは成績を変えない）
-    if (outcome !== "draw") {
+    // 保存（引き分け・タイムアウトは成績を変えない）
+    if (outcome !== "draw" && outcome !== "timeout") {
       for (const a of participants) {
         const isWinner = winners.includes(a);
         await client.query(
@@ -2862,8 +2859,8 @@ async function settleExpiredBattleRooms() {
       const out = await finishBattleRoom(r.room_id, null);
       if (out.status === "settled") {
         n++;
-        console.log(`⏱ [battle] ルーム ${r.room_id}: ${out.elapsedSec}秒経過しても結果(CMD=86)が来なかったため全員負けで精算 → `
-          + out.players.map(p => `${p.author} ${p.rating}(${p.delta})`).join(", "));
+        console.log(`⏱ [battle] ルーム ${r.room_id}: ${out.elapsedSec}秒経過しても結果(CMD=86)が来なかったため結果なしで精算（レート変動なし） → `
+          + out.players.map(p => p.author).join(", "));
       }
     } catch (e) {
       console.error(`バトルルーム(${r.room_id})のタイムアウト精算に失敗:`, e.message);

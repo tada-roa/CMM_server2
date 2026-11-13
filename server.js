@@ -479,7 +479,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
   //   クリアタイム: クリアまでのtick数（最小が勝ち、同値は同時ゴールで全員勝ち）/ 0=切断して退出 / -1=クリアできず
   // 返信: userId の部分をルームIDにして、CMD=86 + (職人名(alphabet) + 新しいレート(Len)) × 参加人数
   //   （引き分け・タイムアウトでもレートを送る。レートの計算は database.js の finishBattleRoom を参照）
-  // CMD=81から10分以上経ってから届いた場合は、全員負け（タイムアウト）として精算される。
+  // CMD=81から10分以上経ってから届いた場合は、結果なし（タイムアウト・レート変動なし）として精算される。
   if (cmd === CMD.BATTLE_RESULT) {
     if (await db.isUserBanned(username)) {
       console.warn(`⚠️ [battle] CMD=86 拒否: ${username} はBANされています → CMD=400を返信`);
@@ -524,7 +524,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       console.log(`   [battle] CMD=86 無視: ルーム ${roomId} ${why}`);
       return;
     }
-    const outcomeLabel = { normal: "通常", draw: "引き分け（レート変動なし）", timeout: "全員負け（タイムアウト）" }[out.outcome] || out.outcome;
+    const outcomeLabel = { normal: "通常", draw: "引き分け（レート変動なし）", timeout: "結果なし（タイムアウト・レート変動なし）" }[out.outcome] || out.outcome;
     console.log(`🏁 [battle] ルーム ${roomId} 精算: ${outcomeLabel}${out.lateResult ? " ※10分を過ぎてから結果が届いたため" : ""}（${out.elapsedSec}秒経過）`);
     if (out.winners.length) console.log(`   [battle] 勝者=[${out.winners.join(", ")}] 敗者=[${out.losers.join(", ")}]`);
     for (const p of out.players) {
