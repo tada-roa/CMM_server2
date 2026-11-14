@@ -229,9 +229,11 @@ async function initDB() {
     -- オンライン対戦のルーム（CMD=81で参加者を保存 → CMD=86の結果でレート更新。10分以内に結果が来なければ全員負け）
     -- オンライン対戦(CMD=81)で、一度選出したコースを記録しておき、出尽くすまで選ばれないようにする
     CREATE TABLE IF NOT EXISTS battle_course_history (
-      course_id  BIGINT    PRIMARY KEY,
-      selected_at BIGINT   NOT NULL
+      course_id   TEXT    PRIMARY KEY,  -- courses.id は TEXT なので型を合わせる
+      selected_at BIGINT  NOT NULL
     );
+    -- 修正前はcourse_idをBIGINTで作っていたため、既に作成済みの環境向けにTEXTへ直す
+    ALTER TABLE battle_course_history ALTER COLUMN course_id TYPE TEXT USING course_id::TEXT;
 
     CREATE TABLE IF NOT EXISTS battle_rooms (
       room_id      TEXT    PRIMARY KEY,
