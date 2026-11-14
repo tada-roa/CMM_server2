@@ -227,6 +227,12 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_battle_rating ON battle_stats(rating DESC);
 
     -- オンライン対戦のルーム（CMD=81で参加者を保存 → CMD=86の結果でレート更新。10分以内に結果が来なければ全員負け）
+    -- オンライン対戦(CMD=81)で、一度選出したコースを記録しておき、出尽くすまで選ばれないようにする
+    CREATE TABLE IF NOT EXISTS battle_course_history (
+      course_id  BIGINT    PRIMARY KEY,
+      selected_at BIGINT   NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS battle_rooms (
       room_id      TEXT    PRIMARY KEY,
       participants TEXT    NOT NULL,                 -- 参加者の職人名のJSON配列
@@ -2949,10 +2955,51 @@ async function applySelectableThreshold() {
   return rowCount;
 }
 
-/** 選出可能なコースからランダムに1つ選んでコースIDを返す（なければ null） */
+// オンライン対戦(CMD=81)のコース選出で使う、同時実行を直列化するためのロックID（適当な固定値でよい）
+const BATTLE_COURSE_PICK_LOCK = 849102;
+
+/**
+ * 選出可能なコースから、まだ一度も選ばれていないものをランダムに1つ選んでコースIDを返す（なければ null）。
+ * 選出可能なコースが「一度も選ばれていないもの」だけでは無くなった場合（全て出尽くした場合）は、
+ * 履歴を空にしてから選び直す（以後、また一通り出尽くすまで同じコースは選ばれない）。
+ * 選んだコースは battle_course_history に記録するので、サーバーを再起動しても履歴は保持される。
+ */
 async function pickRandomSelectableCourse() {
-  const { rows } = await pool.query("SELECT id FROM courses WHERE selectable ORDER BY RANDOM() LIMIT 1");
-  return rows.length ? rows[0].id : null;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // 複数のリクエストが同時に来ても、選出と履歴への記録を順番に行う（コースの重複選出や二重INSERTを防ぐ）
+    await client.query("SELECT pg_advisory_xact_lock($1)", [BATTLE_COURSE_PICK_LOCK]);
+
+    let { rows } = await client.query(
+      `SELECT c.id FROM courses c
+       WHERE c.selectable AND NOT EXISTS (SELECT 1 FROM battle_course_history h WHERE h.course_id = c.id)
+       ORDER BY RANDOM() LIMIT 1`
+    );
+    let resetCount = null;
+    if (!rows.length) {
+      // 未選出のコースがない → 選出可能なコース自体がないのか、全て出尽くしたのかを区別する
+      const { rows: any } = await client.query("SELECT 1 FROM courses WHERE selectable LIMIT 1");
+      if (!any.length) { await client.query("ROLLBACK"); return null; }
+      const { rowCount } = await client.query("DELETE FROM battle_course_history");
+      resetCount = rowCount;
+      ({ rows } = await client.query("SELECT id FROM courses WHERE selectable ORDER BY RANDOM() LIMIT 1"));
+      if (!rows.length) { await client.query("ROLLBACK"); return null; }
+    }
+    const courseId = rows[0].id;
+    await client.query(
+      "INSERT INTO battle_course_history (course_id, selected_at) VALUES ($1, $2) ON CONFLICT (course_id) DO NOTHING",
+      [courseId, Math.floor(Date.now() / 1000)]
+    );
+    await client.query("COMMIT");
+    if (resetCount !== null) console.log(`🔄 [battle] 選出可能な全コース(${resetCount}件)が出尽くしたため、オンライン対戦のコース選出履歴をリセットしました`);
+    return courseId;
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function courseExists(courseId) {
