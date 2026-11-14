@@ -70,6 +70,7 @@ const CMD = {
   BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
   BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
   BATTLE_RESULT:           86,   // オンライン対戦の結果報告（ルーム全員が送る。最初の1件だけ処理）。返信も同じCMD=86（新しいレート）
+  USER_AUTH:               87,   // user_authentication: ログイン中の職人名を認証済みにする。返信も同じCMD=87（データなし）
   GET_ONLINECOURSE_INFO:   84,   // 返信専用: CMD=81/85のコースデータ送信が終わった後に、コースの基本情報（タイトル・職人名）を自動送信する
   GET_COURSEDATA_INDIVIDUAL: 85, // get_coursedata_individual: CMD=81でコース取得に失敗したユーザーが、ルームのコースを個別に再取得する
   LIKE:           20,
@@ -445,6 +446,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
     // ルームIDの後に、参加人数(Len) + 参加者の職人名(alphabet)×人数 が続く。レート更新(CMD=86)のために保存しておく。
     // 読み取れなくてもコースの送信は続ける（その場合、このルームの結果(CMD=86)は無視される）。
+    let unauthenticatedAuthors = null; // 参加者の読み取りに成功した場合だけ、未認証の職人名の配列が入る
     try {
       const { value: count, next: r2 } = decodeLen(s, pos); pos = r2;
       if (!isValidNum(count) || count < 1 || count > db.BATTLE_MAX_PLAYERS) throw new Error(`不正な参加人数: ${count}`);
@@ -459,8 +461,16 @@ async function handleRequest(s, setter, getOnlineUsers) {
       const registered = await db.startBattleRoom(roomId, names);
       if (registered) console.log(`   [battle] ルーム ${roomId}: 参加者を保存しました（10分のカウント開始）`);
       else console.log(`   [battle] ルーム ${roomId}: 精算前のルームが既にあるため、参加者・開始時刻は上書きしません（再送扱い）`);
+      unauthenticatedAuthors = await db.getUnauthenticatedAuthors(names);
     } catch (e) {
       console.warn(`⚠️ [battle] ルーム ${roomId} の参加者を保存できません（残りデータ: "${s.slice(pos, pos + 60)}"）:`, e.message);
+    }
+
+    // CMD=87で認証されていない（または期限切れの）職人が参加者にいる場合は、コースを送信せずCMD=409を送る
+    if (unauthenticatedAuthors && unauthenticatedAuthors.length) {
+      console.warn(`⚠️ [battle] CMD=81: ルーム ${roomId} に未認証の職人がいるため、コースを送信せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
     }
 
     const courseId = await db.getBattleRoomCourse(roomId);
@@ -494,6 +504,15 @@ async function handleRequest(s, setter, getOnlineUsers) {
     if (info.settled) { console.log(`   [battle] CMD=86 無視: ルーム ${roomId} は精算済みです（2件目以降の結果）`); return; }
     const participants = info.participants;
     console.log(`   [battle] ルーム ${roomId}: 登録済みの参加者=[${participants.join(", ")}]（${participants.length}人） CMD=81から${info.elapsedSec}秒`);
+
+    // CMD=87で認証されていない（または期限切れの）職人が参加者にいる場合は、結果を処理せずCMD=409を送る
+    const unauthenticatedAuthors = await db.getUnauthenticatedAuthors(participants);
+    if (unauthenticatedAuthors.length) {
+      console.warn(`⚠️ [battle] CMD=86: ルーム ${roomId} に未認証の職人がいるため、結果を処理せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
+    }
+
     const results = [];
     try {
       for (let i = 0; i < participants.length; i++) {
@@ -550,6 +569,19 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const { value: roomId } = decodeLen(s, pos);
     if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
     console.log(`📥 [battle] CMD=85 受信: 送信者=${username} userId=${userId} ルーム=${roomId}`);
+
+    // CMD=87で認証されていない（または期限切れの）職人が、このルームの参加者（CMD=81で保存済み）にいる場合は、
+    // コースを送信せずCMD=409を送る。参加者情報が無い場合は確認できないので、これまで通り送信する。
+    const roomInfo = await db.getBattleRoomInfo(roomId);
+    if (roomInfo) {
+      const unauthenticatedAuthors = await db.getUnauthenticatedAuthors(roomInfo.participants);
+      if (unauthenticatedAuthors.length) {
+        console.warn(`⚠️ [battle] CMD=85: ルーム ${roomId} に未認証の職人がいるため、コースを送信せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.NOT_ENCRYPTED));
+        return;
+      }
+    }
+
     const courseId = await db.peekBattleRoomCourse(roomId);
     const row = courseId ? await db.getCourseById(courseId) : null;
     if (!row) {
@@ -559,6 +591,26 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
     console.log(`   [battle] CMD=85: ルーム ${roomId} のコース ${courseId}「${row.title}」を userId=${userId} に送信`);
     await sendBattleCourse(setter, parseInt(userId), row);
+    return;
+  }
+
+  // CMD=87 user_authentication: クライアントから、ログイン中の職人名を知らせる。その職人名を認証済みにする（一定時間で失効）。
+  //   usernameではなく職人名そのものに対する認証。CMD=81/85/86で、ルームの参加者にこの認証が無い（または失効した）職人がいた場合、
+  //   その処理は行わず、代わりにCMD=409（アップデートしてください、の通知）を送る。
+  // リクエスト: 基礎データ + ログイン中の職人名(alphabet)
+  // 返信: userIdはそのまま + CMD=87 のみ（データなし。認証を受け付けたことの確認用）
+  if (cmd === CMD.USER_AUTH) {
+    let author;
+    try {
+      ({ value: author } = decodeAlphabet(s, pos));
+      if (!isValidStr(author)) throw new Error("職人名が不正です");
+    } catch (e) {
+      console.warn(`⚠️ [battle] CMD=87 読み取り失敗（送信者=${username}）:`, e.message);
+      return;
+    }
+    await db.recordAuthentication(author);
+    console.log(`🔐 [battle] CMD=87 認証: 職人「${author}」（送信者=${username}）を認証済みにしました`);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.USER_AUTH));
     return;
   }
 
@@ -2189,6 +2241,7 @@ class CloudManager {
         await db.cleanupOldOnlinePeaks(DAU_RETENTION_DAYS);
         await db.cleanupOldBattleMatches(30);
         await db.cleanupOldBattleRooms(1);
+        await db.cleanupOldBattleAuth(1);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }

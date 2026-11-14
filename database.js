@@ -235,6 +235,13 @@ async function initDB() {
     -- 修正前はcourse_idをBIGINTで作っていたため、既に作成済みの環境向けにTEXTへ直す
     ALTER TABLE battle_course_history ALTER COLUMN course_id TYPE TEXT USING course_id::TEXT;
 
+    -- オンライン対戦(CMD=87)のユーザー認証: 「職人名」ごとに、最後にCMD=87を受け取った時刻を覚えておく。
+    -- 一定時間(BATTLE_AUTH_VALID_SECONDS)が経つと失効する。usernameではなく職人名に対する認証。
+    CREATE TABLE IF NOT EXISTS battle_auth (
+      author           TEXT   PRIMARY KEY,
+      authenticated_at BIGINT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS battle_rooms (
       room_id      TEXT    PRIMARY KEY,
       participants TEXT    NOT NULL,                 -- 参加者の職人名のJSON配列
@@ -2684,6 +2691,9 @@ async function recordBattleResult(winnerAuthor, loserAuthor) {
 // ─────────────────────────────────────────────
 // オンライン対戦のルーム管理とレート精算（CMD=81 / CMD=86）
 // ─────────────────────────────────────────────
+// CMD=87の認証が有効な時間。仮に1時間としている（要調整であれば変更してください）
+const BATTLE_AUTH_VALID_SECONDS = 60 * 60;
+
 const BATTLE_RESULT_TIMEOUT_SECONDS = 10 * 60;               // CMD=81から、この時間以内にCMD=86が来なければ結果なし扱い（レート変動なし）
 const BATTLE_DISCONNECT_MULT  = 2;                           // 切断(クリアタイム0)の下がり幅の倍率
 const BATTLE_TIE_GAIN_MULT    = 0.5;                         // 同時ゴールの勝者の上がり幅の倍率
@@ -2957,6 +2967,38 @@ async function applySelectableThreshold() {
   return rowCount;
 }
 
+// ─────────────────────────────────────────────
+// オンライン対戦のユーザー認証（CMD=87）と、未認証の職人の実績リセット
+// ─────────────────────────────────────────────
+
+/** 職人名(author)を認証済みとして記録する（CMD=87）。既に認証済みでも時刻を更新する */
+async function recordAuthentication(author) {
+  const now = Math.floor(Date.now() / 1000);
+  await pool.query(
+    `INSERT INTO battle_auth (author, authenticated_at) VALUES ($1, $2)
+     ON CONFLICT (author) DO UPDATE SET authenticated_at = EXCLUDED.authenticated_at`,
+    [author, now]
+  );
+}
+
+/** authors のうち、認証されていない（一度もCMD=87を送っていない、または期限切れの）職人名を返す */
+async function getUnauthenticatedAuthors(authors) {
+  if (!authors.length) return [];
+  const cutoff = Math.floor(Date.now() / 1000) - BATTLE_AUTH_VALID_SECONDS;
+  const { rows } = await pool.query(
+    "SELECT author FROM battle_auth WHERE author = ANY($1::text[]) AND authenticated_at > $2",
+    [authors, cutoff]
+  );
+  const authed = new Set(rows.map(r => r.author));
+  return authors.filter(a => !authed.has(a));
+}
+
+/** 失効してから十分時間が経った認証記録を削除する（単なる掃除。失効の判定自体には影響しない） */
+async function cleanupOldBattleAuth(retentionDays = 1) {
+  const cutoff = Math.floor(Date.now() / 1000) - Math.max(retentionDays * 24 * 60 * 60, BATTLE_AUTH_VALID_SECONDS);
+  await pool.query("DELETE FROM battle_auth WHERE authenticated_at < $1", [cutoff]);
+}
+
 // オンライン対戦(CMD=81)のコース選出で使う、同時実行を直列化するためのロックID（適当な固定値でよい）
 const BATTLE_COURSE_PICK_LOCK = 849102;
 
@@ -3085,6 +3127,7 @@ module.exports = {
   countWeeklyActiveUsers, countRegisteredMakers,
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings, calcBattleDelta,
   BATTLE_MAX_PLAYERS, startBattleRoom, getBattleRoomInfo, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
+  recordAuthentication, getUnauthenticatedAuthors, cleanupOldBattleAuth, BATTLE_AUTH_VALID_SECONDS,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,
