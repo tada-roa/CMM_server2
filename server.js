@@ -275,6 +275,13 @@ async function sendBattleCourse(setter, targetId, row) {
     encodeLenLen(targetId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(row.title) + encodeAlphabet(row.author));
 }
 
+// 未認証のルーム参加者にCMD=84で送る固定データ。
+// ルームID + CMD=84 + コースタイトル/作者名の部分をそのまま置き換える。
+async function sendBattleCourseInfoOverride(setter, roomId, rawCourseInfo = "2161000100010001000999999999942203733283326") {
+  await sendCloud(setter, randomCloud(CLOUD_VARS_SERVER),
+    encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + rawCourseInfo);
+}
+
 function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
 function isValidStr(value) { return typeof value === "string" && value.length > 0; }
 
@@ -469,7 +476,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     // CMD=87で認証されていない（または期限切れの）職人が参加者にいる場合は、コースを送信せずCMD=409を送る
     if (unauthenticatedAuthors && unauthenticatedAuthors.length) {
       console.warn(`⚠️ [battle] CMD=81: ルーム ${roomId} に未認証の職人がいるため、コースを送信せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
-      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
+      await sendBattleCourseInfoOverride(setter, roomId, "2161000100010001000999999999942203733283326");
       return;
     }
 
@@ -509,7 +516,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const unauthenticatedAuthors = await db.getUnauthenticatedAuthors(participants);
     if (unauthenticatedAuthors.length) {
       console.warn(`⚠️ [battle] CMD=86: ルーム ${roomId} に未認証の職人がいるため、結果を処理せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
-      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
+      await sendBattleCourseInfoOverride(setter, roomId, "2161000100010001000999999999942203733283326");
       return;
     }
 
@@ -2039,7 +2046,7 @@ class CloudManager {
     this.scratch.isReconnecting = true;
     console.log("🔄 Scratch Cloud 接続中...");
 
-    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratchログイン")
+    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratch���グイン")
       .then(sessionId => {
         const ws = new WebSocket("wss://clouddata.scratch.mit.edu", {
           headers: {
@@ -2204,9 +2211,9 @@ class CloudManager {
       try {
         const purged = await db.autoPurgeSuspiciousLikes();
         for (const r of purged) {
-          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴なし=${r.noHistoryCount}, 不正判定ユーザー名数=${r.suspiciousUsernameCount}(投稿履歴あり${r.postedUsernameCount}+関連${r.linkedUsernameCount}), 不正判定ユーザーのいいね=${r.suspiciousLikeCount}, 検知日数=${r.incidentDays})`);
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴...`);
           if (r.escalated) {
-            console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesDeleted}件削除), 職人登録をpendingに(${r.escalation.accountsRevoked}件)`);
+            console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesReset}, プレイ${r.escalation.playsReset})`);
           }
         }
       } catch (e) {
