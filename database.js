@@ -2516,14 +2516,20 @@ const BATTLE_WEEK_SECONDS   = 7 * 24 * 60 * 60; // 「週間」の対象期間
 //     → 格下に勝っても少ししか上がらず、格上に勝つと大きく上がる
 // 負けたときの下がり幅 = BATTLE_K_LOSS × (1 − 勝者の勝つ確率)（レートによらず一定。0未満にはならない）
 const BATTLE_ELO_SCALE = 1000; // この差があると、レートの高い側が勝つ確率は約91%
-const BATTLE_K_WIN_MAX = 200;  // 勝者のレートが0のときのK（上がりやすさの最大）
-const BATTLE_K_WIN_MIN = 10;   // 勝者のレートが9999のときのK（上がりにくさの最大）
-const BATTLE_K_LOSS    = 40;   // 負けたときのK
+const BATTLE_K_LOSS    = 40;   // 負けたときのK（レートによらず一定）
 
-/** 勝者のレートに応じたK。0 → BATTLE_K_WIN_MAX、9999 → BATTLE_K_WIN_MIN。高レートほど急に小さくなる */
+// 勝者のKは、指数関数的に減衰する（レートが上がるほど、上がり幅が急激に小さくなる）。
+// 次の2点を通るように係数を決めている（同格4人対戦で1人が勝った場合、他の3人との平均なので式はそのまま）:
+//   レート1000 → 上がり幅 約70（K×0.5 = 70 → K ≈ 140）
+//   レート6000 → 上がり幅 約3（K×0.5 = 3  → K ≈ 6）
+// ただし、レートが低いうちはこの式だと200を超えてしまうため、以前からの上限200でそこは頭打ちにしている。
+const BATTLE_K_WIN_BASE  = 262.86; // 式の上でのK(0)（実際はBATTLE_K_WIN_CAPで頭打ち）
+const BATTLE_K_WIN_DECAY = 1587.36; // 大きいほど、減衰がゆるやかになる
+const BATTLE_K_WIN_CAP   = 200;    // 低レート側の上限（以前のBATTLE_K_WIN_MAXと同じ値）
+
+/** 勝者のレートに応じたK。指数関数的に減衰し、低レート側はBATTLE_K_WIN_CAPで頭打ちになる */
 function battleWinK(rating) {
-  const remain = 1 - rating / BATTLE_MAX_RATING; // 1(最低) → 0(最高)
-  return BATTLE_K_WIN_MIN + (BATTLE_K_WIN_MAX - BATTLE_K_WIN_MIN) * remain * remain;
+  return Math.min(BATTLE_K_WIN_CAP, BATTLE_K_WIN_BASE * Math.exp(-rating / BATTLE_K_WIN_DECAY));
 }
 
 const clampBattleRating = r => Math.min(BATTLE_MAX_RATING, Math.max(BATTLE_MIN_RATING, r));
