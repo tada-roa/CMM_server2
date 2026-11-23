@@ -2287,6 +2287,7 @@ class CloudManager {
 
   scheduleServerVersionBroadcast() {
     // CMD=-10: サーバーバージョンを、userId=-1固定で5秒おきに全クライアントへ通知する。
+    // 内容データ: サーバーバージョン(Len) + 2000年1月1日(UTC)からの経過秒数・四捨五入(LenLen)
     // バージョンはDBのserver_settingsテーブル(key='server_version')から読む（Len形式のため整数で保存すること）。
     // Supabaseのテーブルエディタでそのvalueを直接書き換えれば、次の送信（最大5秒後）から反映される（サーバーの再起動は不要）。
     let running = false;
@@ -2298,7 +2299,8 @@ class CloudManager {
         if (version == null) { console.warn("⚠️ [server_version] DBに server_version が設定されていません（server_settingsテーブル）"); return; }
         const versionNum = parseInt(version, 10);
         if (!Number.isInteger(versionNum)) { console.warn(`⚠️ [server_version] server_version の値が整数ではありません: "${version}"（Len形式で送るため整数である必要があります）`); return; }
-        const payload = encodeLenLen(-1) + encodeLen(CMD.SERVER_VERSION) + encodeLen(versionNum);
+        const secondsSince2000 = Math.round((Date.now() - Date.UTC(2000, 0, 1)) / 1000);
+        const payload = encodeLenLen(-1) + encodeLen(CMD.SERVER_VERSION) + encodeLen(versionNum) + encodeLenLen(secondsSince2000);
         await this.broadcastCloud(payload);
       } catch (e) {
         console.error("サーバーバージョン通知(CMD=-10)失敗:", e.message);
