@@ -610,7 +610,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await db.recordAuthentication(author);
-    console.log(`🔐 [battle] CMD=87 認証: 職人「${author}」（送信者=${username}）を認証済みにしました`);
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.USER_AUTH));
     return;
   }
