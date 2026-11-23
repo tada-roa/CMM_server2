@@ -86,11 +86,12 @@ const CMD = {
   DISABLED:     1001,   // 使用不可CMDを受信したときの返信
   NOT_ENCRYPTED: 409,   // 暗号化されていないと思われるパスワードを受信したときの返信
   BANNED:        400,   // 返信専用: BANされているユーザー名からのCMD=81/86を拒否したときの返信
+  SERVER_VERSION: -10,  // 返信専用（定期送信）: サーバーバージョンを5秒おきに全クライアントへ通知する（userId=-1固定）
 };
 
 // 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
 const KNOWN_CMDS = Object.fromEntries(
-  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED" && k !== "GET_ONLINECOURSE_INFO")
+  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED" && k !== "GET_ONLINECOURSE_INFO" && k !== "SERVER_VERSION")
 );
 
 const SEND_INTERVAL = 120;
@@ -273,13 +274,6 @@ async function sendBattleCourse(setter, targetId, row) {
   await sendCourseData(setter, targetId, row.stage_data);
   await sendCloud(setter, randomCloud(CLOUD_VARS_SERVER),
     encodeLenLen(targetId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(row.title) + encodeAlphabet(row.author));
-}
-
-// 未認証のルーム参加者にCMD=84で送る固定データ。
-// ルームID + CMD=84 + コースタイトル/作者名の部分をそのまま置き換える。
-async function sendBattleCourseInfoOverride(setter, roomId, rawCourseInfo = "2161000100010001000999999999942203733283326") {
-  await sendCloud(setter, randomCloud(CLOUD_VARS_SERVER),
-    encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + rawCourseInfo);
 }
 
 function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
@@ -476,7 +470,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     // CMD=87で認証されていない（または期限切れの）職人が参加者にいる場合は、コースを送信せずCMD=409を送る
     if (unauthenticatedAuthors && unauthenticatedAuthors.length) {
       console.warn(`⚠️ [battle] CMD=81: ルーム ${roomId} に未認証の職人がいるため、コースを送信せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
-      await sendBattleCourseInfoOverride(setter, roomId, "2161000100010001000999999999942203733283326");
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
       return;
     }
 
@@ -516,7 +510,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const unauthenticatedAuthors = await db.getUnauthenticatedAuthors(participants);
     if (unauthenticatedAuthors.length) {
       console.warn(`⚠️ [battle] CMD=86: ルーム ${roomId} に未認証の職人がいるため、結果を処理せずCMD=409を送信します。未認証=[${unauthenticatedAuthors.join(", ")}]`);
-      await sendBattleCourseInfoOverride(setter, roomId, "2161000100010001000999999999942203733283326");
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(CMD.NOT_ENCRYPTED));
       return;
     }
 
@@ -616,6 +610,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await db.recordAuthentication(author);
+    console.log(`🔐 [battle] CMD=87 認証: 職人「${author}」（送信者=${username}）を認証済みにしました`);
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.USER_AUTH));
     return;
   }
@@ -2046,7 +2041,7 @@ class CloudManager {
     this.scratch.isReconnecting = true;
     console.log("🔄 Scratch Cloud 接続中...");
 
-    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratch���グイン")
+    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratchログイン")
       .then(sessionId => {
         const ws = new WebSocket("wss://clouddata.scratch.mit.edu", {
           headers: {
@@ -2066,6 +2061,7 @@ class CloudManager {
           ws.send(JSON.stringify({ method: "set", name, value: String(value), user: USERNAME, project_id: PROJECT_ID }) + "\n");
           return Promise.resolve();
         };
+        this.scratch.setter = setter; // サーバーバージョン通知など、受信とは無関係にこちらから送る処理で使う
 
         ws.on("open", async () => {
           clearTimeout(connectTimeout);
@@ -2126,6 +2122,7 @@ class CloudManager {
         ws.send(JSON.stringify({ method: "set", name, value: String(value), user: "server-bot", project_id: PROJECT_ID }));
         return Promise.resolve();
       };
+      this.turbowarp.setter = setter; // サーバーバージョン通知など、受信とは無関係にこちらから送る処理で使う
       ws.on("open", async () => {
         ws.send(JSON.stringify({ method: "handshake", user: "server-bot", project_id: PROJECT_ID }));
         this.turbowarp.conn  = ws;
@@ -2211,9 +2208,9 @@ class CloudManager {
       try {
         const purged = await db.autoPurgeSuspiciousLikes();
         for (const r of purged) {
-          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴...`);
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴なし=${r.noHistoryCount}, 不正判定ユーザー名数=${r.suspiciousUsernameCount}(投稿履歴あり${r.postedUsernameCount}+関連${r.linkedUsernameCount}), 不正判定ユーザーのいいね=${r.suspiciousLikeCount}, 検知日数=${r.incidentDays})`);
           if (r.escalated) {
-            console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesReset}, プレイ${r.escalation.playsReset})`);
+            console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesDeleted}件削除), 職人登録をpendingに(${r.escalation.accountsRevoked}件)`);
           }
         }
       } catch (e) {
@@ -2275,6 +2272,46 @@ class CloudManager {
     console.log("📅 バトルルームのタイムアウト精算: 30秒ごとに確認（CMD=81から10分）");
   }
 
+  /** 受信への返信ではなく、こちらから能動的に送るとき用。接続中の全クラウド接続（Scratch/TurboWarp）に同じ内容を送る */
+  async broadcastCloud(payload) {
+    const targets = [];
+    if (this.scratch.conn?.readyState === WebSocket.OPEN && this.scratch.setter) targets.push(this.scratch.setter);
+    if (this.turbowarp.conn?.readyState === WebSocket.OPEN && this.turbowarp.setter) targets.push(this.turbowarp.setter);
+    for (const setter of targets) {
+      try {
+        await sendCloud(setter, randomCloud(), payload);
+      } catch (e) {
+        console.warn("⚠️ ブロードキャスト送信失敗:", e.message);
+      }
+    }
+  }
+
+  scheduleServerVersionBroadcast() {
+    // CMD=-10: サーバーバージョンを、userId=-1固定で5秒おきに全クライアントへ通知する。
+    // バージョンはDBのserver_settingsテーブル(key='server_version')から読む（Len形式のため整数で保存すること）。
+    // Supabaseのテーブルエディタでそのvalueを直接書き換えれば、次の送信（最大5秒後）から反映される（サーバーの再起動は不要）。
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const version = await db.getServerSetting("server_version");
+        if (version == null) { console.warn("⚠️ [server_version] DBに server_version が設定されていません（server_settingsテーブル）"); return; }
+        const versionNum = parseInt(version, 10);
+        if (!Number.isInteger(versionNum)) { console.warn(`⚠️ [server_version] server_version の値が整数ではありません: "${version}"（Len形式で送るため整数である必要があります）`); return; }
+        const payload = encodeLenLen(-1) + encodeLen(CMD.SERVER_VERSION) + encodeLen(versionNum);
+        await this.broadcastCloud(payload);
+      } catch (e) {
+        console.error("サーバーバージョン通知(CMD=-10)失敗:", e.message);
+      } finally {
+        running = false;
+      }
+    };
+    run();
+    setInterval(run, 5 * 1000).unref();
+    console.log("📅 サーバーバージョン通知(CMD=-10): 5秒ごとに送信");
+  }
+
   scheduleDMPurge() {
     // 2026/10/20 1:00(JST)を過ぎたら、DM(chat_dm)を全削除する（全体チャットは残す）
     // 1:00以降に起動した場合も、起動直後に実行される。成功したら以降は実行しない。
@@ -2331,6 +2368,7 @@ class CloudManager {
     this.scheduleChatCleanup();
     this.scheduleDMPurge();
     this.scheduleBattleRoomSettle();
+    this.scheduleServerVersionBroadcast();
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);

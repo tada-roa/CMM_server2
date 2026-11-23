@@ -310,6 +310,14 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_recommended_added ON recommended_courses(added_at DESC);
 
     -- メンテナンス用の特別ユーザー名（id=1の1行しか持てない＝常に最大1つ）
+    -- 汎用のサーバー設定（key-value）。CMD=-10で5秒ごとに通知する「サーバーバージョン」はここに保存する。
+    -- Supabaseのテーブルエディタから直接 value を書き換えれば、そのまま反映される（サーバーの再起動は不要）。
+    CREATE TABLE IF NOT EXISTS server_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    INSERT INTO server_settings (key, value) VALUES ('server_version', '1000') ON CONFLICT (key) DO NOTHING;
+
     CREATE TABLE IF NOT EXISTS bypass_username (
       id         INT     PRIMARY KEY CHECK (id = 1),
       username   TEXT    NOT NULL,
@@ -3093,6 +3101,21 @@ function pruneBattleRoomCourses() {
   for (const [k, e] of battleRoomCourses) if (now >= e.expires) battleRoomCourses.delete(k);
 }
 
+/** server_settingsから値を読む（なければnull） */
+async function getServerSetting(key) {
+  const { rows } = await pool.query("SELECT value FROM server_settings WHERE key = $1", [key]);
+  return rows.length ? rows[0].value : null;
+}
+
+/** server_settingsに値を書く（運用スクリプト等からの利用を想定。通常はSupabaseのテーブルエディタで直接編集すればよい） */
+async function setServerSetting(key, value) {
+  await pool.query(
+    `INSERT INTO server_settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, String(value)]
+  );
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -3134,6 +3157,7 @@ module.exports = {
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings, calcBattleDelta,
   BATTLE_MAX_PLAYERS, startBattleRoom, getBattleRoomInfo, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
   recordAuthentication, getUnauthenticatedAuthors, cleanupOldBattleAuth, BATTLE_AUTH_VALID_SECONDS,
+  getServerSetting, setServerSetting,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,
