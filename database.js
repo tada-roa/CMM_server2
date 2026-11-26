@@ -42,6 +42,17 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_courses_unjudged   ON courses(posted_at) WHERE selectable IS NULL;
     CREATE INDEX IF NOT EXISTS idx_courses_selectable ON courses(id)        WHERE selectable;
 
+    -- コースごとの、営業日(JST 6:00〜翌5:59)単位の挑戦回数(attempt_count)。週間プレイ回数ランキングの集計に使う。
+    -- 「プレイ回数ランキング」で言う"プレイ回数"は attempt_count のこと（play_countではない）。
+    -- 全期間の回数は courses.attempt_count に既にあるので、ここでは直近分だけ覚えておけばよい。
+    CREATE TABLE IF NOT EXISTS course_daily_attempts (
+      course_id    TEXT   NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      business_day TEXT   NOT NULL,
+      attempt_count INT   NOT NULL DEFAULT 0,
+      PRIMARY KEY (course_id, business_day)
+    );
+    CREATE INDEX IF NOT EXISTS idx_course_daily_attempts_day ON course_daily_attempts(business_day);
+
     CREATE TABLE IF NOT EXISTS likes (
       id         SERIAL  PRIMARY KEY,
       username   TEXT    NOT NULL,
@@ -604,6 +615,43 @@ async function getMakerRankingWeek(limit) {
   return results.slice(0, limit);
 }
 
+// 週間プレイ回数ランキング（職人単位: その職人の全コースの、直近7営業日分の挑戦回数(attempt_count)の合計）
+// 営業日の終わりは getBusinessDayForDisplay() に合わせる（深夜1:00〜5:59は、直前に終わった営業日を終端にする）
+async function getAuthorWeeklyPlayRanking(limit) {
+  const endDay = getBusinessDayForDisplay();
+  const startDay = shiftBusinessDay(endDay, -6);
+  const { rows } = await pool.query(
+    `SELECT c.author, COALESCE(SUM(d.attempt_count), 0) AS weekly_plays
+     FROM course_daily_attempts d
+     JOIN courses c ON c.id = d.course_id
+     WHERE d.business_day BETWEEN $1 AND $2
+     GROUP BY c.author
+     ORDER BY weekly_plays DESC
+     LIMIT $3`,
+    [startDay, endDay, limit]
+  );
+  return rows.map(r => ({ author: r.author, plays: parseInt(r.weekly_plays, 10) }));
+}
+
+// 全期間プレイ回数ランキング（職人単位: その職人の全コースの attempt_count の合計。既存の累計値をそのまま使う）
+async function getAuthorAllTimePlayRanking(limit) {
+  const { rows } = await pool.query(
+    `SELECT author, COALESCE(SUM(attempt_count), 0) AS total_plays
+     FROM courses
+     GROUP BY author
+     ORDER BY total_plays DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => ({ author: r.author, plays: parseInt(r.total_plays, 10) }));
+}
+
+/** 古い日次挑戦回数バケットを削除する（週間ランキングには直近7営業日分あれば十分なので、それより前は不要） */
+async function cleanupOldCourseDailyPlays(retentionDays = 14) {
+  const cutoffDay = shiftBusinessDay(getBusinessDayForDisplay(), -retentionDays);
+  await pool.query("DELETE FROM course_daily_attempts WHERE business_day < $1", [cutoffDay]);
+}
+
 // CMD=17: 職人ランキング（累計）
 // パフォーマンス改善: official_makersを1回だけ取得してSetで判定する（N+1クエリ排除）
 async function getMakerRankingAllTime(limit) {
@@ -870,10 +918,23 @@ async function incrementPlay(courseId, excludeUsername = null) {
 }
 
 async function incrementAttempt(courseId, excludeUsername = null) {
-  await pool.query(
+  const { rowCount } = await pool.query(
     "UPDATE courses SET attempt_count=attempt_count+1 WHERE id=$1 AND ($2::text IS NULL OR username <> $2::text)",
     [courseId, excludeUsername]
   );
+  // 実際にカウントされた（自作コースの除外に引っかからなかった）場合だけ、週間プレイ回数ランキング用の日次バケットも増やす。
+  // 営業日の切り替わりの谷間(深夜1:00〜5:59)はどの営業日にも属さないので、その間は日次バケットには記録しない
+  // （全期間のattempt_countへの加算はこの間も行われる。影響するのは週間ランキングの集計だけ）。
+  if (rowCount > 0) {
+    const businessDay = getBusinessDayForRecording();
+    if (businessDay) {
+      await pool.query(
+        `INSERT INTO course_daily_attempts (course_id, business_day, attempt_count) VALUES ($1, $2, 1)
+         ON CONFLICT (course_id, business_day) DO UPDATE SET attempt_count = course_daily_attempts.attempt_count + 1`,
+        [courseId, businessDay]
+      );
+    }
+  }
 }
 
 async function incrementClear(courseId, excludeUsername = null) {
@@ -3158,6 +3219,7 @@ module.exports = {
   BATTLE_MAX_PLAYERS, startBattleRoom, getBattleRoomInfo, getActiveBattleRoom, finishBattleRoom, settleExpiredBattleRooms, cleanupOldBattleRooms,
   recordAuthentication, getUnauthenticatedAuthors, cleanupOldBattleAuth, BATTLE_AUTH_VALID_SECONDS,
   getServerSetting, setServerSetting,
+  getAuthorWeeklyPlayRanking, getAuthorAllTimePlayRanking, cleanupOldCourseDailyPlays,
   getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, peekBattleRoomCourse, pruneBattleRoomCourses,
